@@ -1,0 +1,2962 @@
+From 3f8042ecc8099b8a6568b49646ec8a2913928091 Mon Sep 17 00:00:00 2001
+From: Pin-Tuan Huang <melody.hpt508@gmail.com>
+Date: Fri, 5 Apr 2019 22:59:01 +0800
+Subject: [PATCH] initial commit for DcAE
+
+---
+ egs/wsj/s5/local/nnet3/run_tdnn_dcae.sh            | 174 ++++++
+ egs/wsj/s5/local/nnet3/run_tdnn_dcae_U.sh          | 174 ++++++
+ egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae.sh       | 300 +++++++++++
+ egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae_U.sh     | 300 +++++++++++
+ .../s5/steps/libs/nnet3/xconfig/basic_layers.py    |   2 +
+ egs/wsj/s5/steps/nnet3/get_egs_dcae.sh             | 494 +++++++++++++++++
+ egs/wsj/s5/steps/nnet3/train_dcae_dnn.py           | 499 +++++++++++++++++
+ egs/wsj/s5/steps/nnet3/train_dcae_rnn.py           | 594 +++++++++++++++++++++
+ src/nnet3bin/Makefile                              |   2 +-
+ src/nnet3bin/nnet3-get-egs-dcae.cc                 | 324 +++++++++++
+ 10 files changed, 2862 insertions(+), 1 deletion(-)
+ create mode 100755 egs/wsj/s5/local/nnet3/run_tdnn_dcae.sh
+ create mode 100755 egs/wsj/s5/local/nnet3/run_tdnn_dcae_U.sh
+ create mode 100755 egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae.sh
+ create mode 100755 egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae_U.sh
+ create mode 100755 egs/wsj/s5/steps/nnet3/get_egs_dcae.sh
+ create mode 100755 egs/wsj/s5/steps/nnet3/train_dcae_dnn.py
+ create mode 100755 egs/wsj/s5/steps/nnet3/train_dcae_rnn.py
+ create mode 100644 src/nnet3bin/nnet3-get-egs-dcae.cc
+
+diff --git a/egs/wsj/s5/local/nnet3/run_tdnn_dcae.sh b/egs/wsj/s5/local/nnet3/run_tdnn_dcae.sh
+new file mode 100755
+index 0000000..1545d8d
+--- /dev/null
++++ b/egs/wsj/s5/local/nnet3/run_tdnn_dcae.sh
+@@ -0,0 +1,174 @@
++#!/bin/bash
++
++#    This is the standard "tdnn" system, built in nnet3 with xconfigs.
++
++
++# local/nnet3/compare_wer.sh exp/nnet3/tdnn1a_sp
++# System                tdnn1a_sp
++#WER dev93 (tgpr)                9.18
++#WER dev93 (tg)                  8.59
++#WER dev93 (big-dict,tgpr)       6.45
++#WER dev93 (big-dict,fg)         5.83
++#WER eval92 (tgpr)               6.15
++#WER eval92 (tg)                 5.55
++#WER eval92 (big-dict,tgpr)      3.58
++#WER eval92 (big-dict,fg)        2.98
++# Final train prob        -0.7200
++# Final valid prob        -0.8834
++# Final train acc          0.7762
++# Final valid acc          0.7301
++
++set -e -o pipefail -u
++
++# First the options that are passed through to run_ivector_common.sh
++# (some of which are also used in this script directly).
++stage=0
++nj=30
++
++train_set=train_si284
++test_sets="test_dev93 test_eval92"
++gmm=tri4b        # this is the source gmm-dir that we'll use for alignments; it
++                 # should have alignments for the specified training data.
++num_threads_ubm=32
++nnet3_affix=       # affix for exp dirs, e.g. it was _cleaned in tedlium.
++tdnn_affix=_dcae  #affix for TDNN directory e.g. "1a" or "1b", in case we change the configuration.
++
++# Options which are not passed through to run_ivector_common.sh
++train_stage=-10
++remove_egs=true
++srand=0
++reporting_email=
++# set common_egs_dir to use previously dumped egs.
++common_egs_dir=
++
++#weight for dcae
++weight=0.9999999999
++weight_ae=0.0000000001
++
++. ./cmd.sh
++. ./path.sh
++. ./utils/parse_options.sh
++
++if ! cuda-compiled; then
++  cat <<EOF && exit 1
++This script is intended to be used with GPUs but you have not compiled Kaldi with CUDA
++If you want to use GPUs (and have them), go to src/, and configure and make on a machine
++where "nvcc" is installed.
++EOF
++fi
++
++local/nnet3/run_ivector_common.sh --stage $stage --nj $nj \
++                                  --train-set $train_set --gmm $gmm \
++                                  --num-threads-ubm $num_threads_ubm \
++                                  --nnet3-affix "$nnet3_affix"
++
++
++
++gmm_dir=exp/${gmm}
++ali_dir=exp/${gmm}_ali_${train_set}_sp
++dir=exp/nnet3${nnet3_affix}/tdnn${tdnn_affix}_sp/${weight_ae}
++train_data_dir=data/${train_set}_sp_hires
++train_ivector_dir=exp/nnet3${nnet3_affix}/ivectors_${train_set}_sp_hires
++
++for f in $train_data_dir/feats.scp $train_ivector_dir/ivector_online.scp \
++    $gmm_dir/{graph_tgpr,graph_bd_tgpr}/HCLG.fst \
++    $ali_dir/ali.1.gz $gmm_dir/final.mdl; do
++  [ ! -f $f ] && echo "$0: expected file $f to exist" && exit 1
++done
++
++
++if [ $stage -le 12 ]; then
++  mkdir -p $dir
++  echo "$0: creating neural net configs using the xconfig parser";
++
++  num_targets=$(tree-info $gmm_dir/tree |grep num-pdfs|awk '{print $2}')
++  
++  mkdir -p $dir/configs
++  cat <<EOF > $dir/configs/network.xconfig
++  input dim=100 name=ivector
++  input dim=40 name=input
++
++  # please note that it is important to have input layer with the name=input
++  # as the layer immediately preceding the fixed-affine-layer to enable
++  # the use of short notation for the descriptor
++  fixed-affine-layer name=lda input=Append(-2,-1,0,1,2,ReplaceIndex(ivector, t, 0)) affine-transform-file=$dir/configs/lda.mat
++
++  # the first splicing is moved before the lda layer, so no splicing here
++  relu-renorm-layer name=tdnn1 dim=650
++  relu-renorm-layer name=tdnn2 dim=650 input=Append(-1,0,1)
++  relu-renorm-layer name=tdnn3 dim=650 input=Append(-1,0,1)
++  relu-renorm-layer name=tdnn4 dim=650 input=Append(-3,0,3)
++  relu-renorm-layer name=tdnn5 dim=650 input=Append(-6,-3,0)
++
++  relu-renorm-layer name=tdnn6 dim=650
++  relu-renorm-layer name=tdnn7 input=tdnn5 dim=650
++  relu-renorm-layer name=tdnn8 input=Append(0, tdnn6) dim=650
++  relu-renorm-layer name=tdnn9 dim=650
++  relu-renorm-layer name=tdnn10 dim=650
++  output-layer name=output dim=$num_targets input=tdnn6 max-change=1.5 learning-rate-factor=$weight
++  output-layer name=output_ae include-log-softmax=false learning-rate-factor=$weight_ae max-change=1.0 objective-type=quadratic input=tdnn10 dim=40
++EOF
++  steps/nnet3/xconfig_to_configs.py --xconfig-file $dir/configs/network.xconfig --config-dir $dir/configs/
++fi
++
++
++
++if [ $stage -le 13 ]; then
++  if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d $dir/egs/storage ]; then
++    utils/create_split_dir.pl \
++     /export/b0{3,4,5,6}/$USER/kaldi-data/egs/tedlium-$(date +'%m_%d_%H_%M')/s5_r2/$dir/egs/storage $dir/egs/storage
++  fi
++
++  steps/nnet3/train_dcae_dnn.py --stage=$train_stage \
++    --cmd="$decode_cmd" \
++    --feat.online-ivector-dir=$train_ivector_dir \
++    --feat.cmvn-opts="--norm-means=false --norm-vars=false" \
++    --trainer.srand=$srand \
++    --trainer.max-param-change=2.0 \
++    --trainer.num-epochs=3 \
++    --trainer.samples-per-iter=400000 \
++    --trainer.optimization.num-jobs-initial=2 \
++    --trainer.optimization.num-jobs-final=2 \
++    --trainer.num-jobs-compute-prior=2 \
++    --trainer.optimization.initial-effective-lrate=0.0015 \
++    --trainer.optimization.final-effective-lrate=0.00015 \
++    --trainer.optimization.minibatch-size=256,128 \
++    --egs.dir="$common_egs_dir" \
++    --cleanup.remove-egs=$remove_egs \
++    --use-gpu=wait \
++    --feat-dir=$train_data_dir \
++    --ali-dir=$ali_dir \
++    --lang=data/lang \
++    --reporting.email="$reporting_email" \
++    --dir=$dir  || exit 1;
++fi
++
++if [ $stage -le 14 ]; then
++  # note: for TDNNs, looped decoding gives exactly the same results
++  # as regular decoding, so there is no point in testing it separately.
++  # We use regular decoding because it supports multi-threaded (we just
++  # didn't create the binary for that, for looped decoding, so far).
++  rm $dir/.error || true 2>/dev/null
++  for data in $test_sets; do
++    (
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/nnet3/decode.sh --nj $nj --cmd "$decode_cmd"  --num-threads 4 \
++           --online-ivector-dir exp/nnet3${nnet3_affix}/ivectors_${data}_hires \
++          ${graph_dir} data/${data}_hires ${dir}/decode_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}/decode_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}/decode_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++
++exit 0;
+diff --git a/egs/wsj/s5/local/nnet3/run_tdnn_dcae_U.sh b/egs/wsj/s5/local/nnet3/run_tdnn_dcae_U.sh
+new file mode 100755
+index 0000000..faf1c3b
+--- /dev/null
++++ b/egs/wsj/s5/local/nnet3/run_tdnn_dcae_U.sh
+@@ -0,0 +1,174 @@
++#!/bin/bash
++
++#    This is the standard "tdnn" system, built in nnet3 with xconfigs.
++
++
++# local/nnet3/compare_wer.sh exp/nnet3/tdnn1a_sp
++# System                tdnn1a_sp
++#WER dev93 (tgpr)                9.18
++#WER dev93 (tg)                  8.59
++#WER dev93 (big-dict,tgpr)       6.45
++#WER dev93 (big-dict,fg)         5.83
++#WER eval92 (tgpr)               6.15
++#WER eval92 (tg)                 5.55
++#WER eval92 (big-dict,tgpr)      3.58
++#WER eval92 (big-dict,fg)        2.98
++# Final train prob        -0.7200
++# Final valid prob        -0.8834
++# Final train acc          0.7762
++# Final valid acc          0.7301
++
++set -e -o pipefail -u
++
++# First the options that are passed through to run_ivector_common.sh
++# (some of which are also used in this script directly).
++stage=0
++nj=30
++
++train_set=train_si284
++test_sets="test_dev93 test_eval92"
++gmm=tri4b        # this is the source gmm-dir that we'll use for alignments; it
++                 # should have alignments for the specified training data.
++num_threads_ubm=32
++nnet3_affix=       # affix for exp dirs, e.g. it was _cleaned in tedlium.
++tdnn_affix=_dcae_U  #affix for TDNN directory e.g. "1a" or "1b", in case we change the configuration.
++
++# Options which are not passed through to run_ivector_common.sh
++train_stage=-10
++remove_egs=true
++srand=0
++reporting_email=
++# set common_egs_dir to use previously dumped egs.
++common_egs_dir=
++
++#weight for dcae
++weight=0.99999999999
++weight_ae=0.00000000001
++
++. ./cmd.sh
++. ./path.sh
++. ./utils/parse_options.sh
++
++if ! cuda-compiled; then
++  cat <<EOF && exit 1
++This script is intended to be used with GPUs but you have not compiled Kaldi with CUDA
++If you want to use GPUs (and have them), go to src/, and configure and make on a machine
++where "nvcc" is installed.
++EOF
++fi
++
++local/nnet3/run_ivector_common.sh --stage $stage --nj $nj \
++                                  --train-set $train_set --gmm $gmm \
++                                  --num-threads-ubm $num_threads_ubm \
++                                  --nnet3-affix "$nnet3_affix"
++
++
++
++gmm_dir=exp/${gmm}
++ali_dir=exp/${gmm}_ali_${train_set}_sp
++dir=exp/nnet3${nnet3_affix}/tdnn${tdnn_affix}_sp/${weight_ae}
++train_data_dir=data/${train_set}_sp_hires
++train_ivector_dir=exp/nnet3${nnet3_affix}/ivectors_${train_set}_sp_hires
++
++for f in $train_data_dir/feats.scp $train_ivector_dir/ivector_online.scp \
++    $gmm_dir/{graph_tgpr,graph_bd_tgpr}/HCLG.fst \
++    $ali_dir/ali.1.gz $gmm_dir/final.mdl; do
++  [ ! -f $f ] && echo "$0: expected file $f to exist" && exit 1
++done
++
++
++if [ $stage -le 12 ]; then
++  mkdir -p $dir
++  echo "$0: creating neural net configs using the xconfig parser";
++
++  num_targets=$(tree-info $gmm_dir/tree |grep num-pdfs|awk '{print $2}')
++  
++  mkdir -p $dir/configs
++  cat <<EOF > $dir/configs/network.xconfig
++  input dim=100 name=ivector
++  input dim=40 name=input
++
++  # please note that it is important to have input layer with the name=input
++  # as the layer immediately preceding the fixed-affine-layer to enable
++  # the use of short notation for the descriptor
++  fixed-affine-layer name=lda input=Append(-2,-1,0,1,2,ReplaceIndex(ivector, t, 0)) affine-transform-file=$dir/configs/lda.mat
++
++  # the first splicing is moved before the lda layer, so no splicing here
++  relu-renorm-layer name=tdnn1 dim=650
++  relu-renorm-layer name=tdnn2 dim=650 input=Append(-1,0,1)
++  relu-renorm-layer name=tdnn3 dim=650 input=Append(-1,0,1)
++  relu-renorm-layer name=tdnn4 dim=650 input=Append(-3,0,3)
++  relu-renorm-layer name=tdnn5 dim=650 input=Append(-6,-3,0)
++
++  relu-renorm-layer name=tdnn6 dim=650
++  relu-renorm-layer name=tdnn7 input=tdnn5 dim=650
++  relu-renorm-layer name=tdnn8 input=Append(0, tdnn6) dim=650
++  relu-renorm-layer name=tdnn9 input=Sum(0, Scale(0.5, tdnn2)) dim=650
++  relu-renorm-layer name=tdnn10 input=Sum(0, Scale(0.5, tdnn1)) dim=650
++  output-layer name=output dim=$num_targets input=tdnn6 max-change=1.5 learning-rate-factor=$weight
++  output-layer name=output_ae include-log-softmax=false learning-rate-factor=$weight_ae max-change=1.0 objective-type=quadratic input=tdnn10 dim=40
++EOF
++  steps/nnet3/xconfig_to_configs.py --xconfig-file $dir/configs/network.xconfig --config-dir $dir/configs/
++fi
++
++
++
++if [ $stage -le 13 ]; then
++  if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d $dir/egs/storage ]; then
++    utils/create_split_dir.pl \
++     /export/b0{3,4,5,6}/$USER/kaldi-data/egs/tedlium-$(date +'%m_%d_%H_%M')/s5_r2/$dir/egs/storage $dir/egs/storage
++  fi
++
++  steps/nnet3/train_dcae_dnn.py --stage=$train_stage \
++    --cmd="$decode_cmd" \
++    --feat.online-ivector-dir=$train_ivector_dir \
++    --feat.cmvn-opts="--norm-means=false --norm-vars=false" \
++    --trainer.srand=$srand \
++    --trainer.max-param-change=2.0 \
++    --trainer.num-epochs=3 \
++    --trainer.samples-per-iter=400000 \
++    --trainer.optimization.num-jobs-initial=2 \
++    --trainer.optimization.num-jobs-final=2 \
++    --trainer.num-jobs-compute-prior=2 \
++    --trainer.optimization.initial-effective-lrate=0.0015 \
++    --trainer.optimization.final-effective-lrate=0.00015 \
++    --trainer.optimization.minibatch-size=256,128 \
++    --egs.dir="$common_egs_dir" \
++    --cleanup.remove-egs=$remove_egs \
++    --use-gpu=wait \
++    --feat-dir=$train_data_dir \
++    --ali-dir=$ali_dir \
++    --lang=data/lang \
++    --reporting.email="$reporting_email" \
++    --dir=$dir  || exit 1;
++fi
++
++if [ $stage -le 14 ]; then
++  # note: for TDNNs, looped decoding gives exactly the same results
++  # as regular decoding, so there is no point in testing it separately.
++  # We use regular decoding because it supports multi-threaded (we just
++  # didn't create the binary for that, for looped decoding, so far).
++  rm $dir/.error || true 2>/dev/null
++  for data in $test_sets; do
++    (
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/nnet3/decode.sh --nj $nj --cmd "$decode_cmd"  --num-threads 4 \
++           --online-ivector-dir exp/nnet3${nnet3_affix}/ivectors_${data}_hires \
++          ${graph_dir} data/${data}_hires ${dir}/decode_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}/decode_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}/decode_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++
++exit 0;
+diff --git a/egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae.sh b/egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae.sh
+new file mode 100755
+index 0000000..fad4987
+--- /dev/null
++++ b/egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae.sh
+@@ -0,0 +1,300 @@
++#!/bin/bash
++
++
++# run_tdnn_lstm_1a.sh is a TDNN+LSTM system.  Compare with the TDNN
++# system in run_tdnn_1a.sh.  Configuration is similar to
++# the same-named script run_tdnn_lstm_1a.sh in
++# egs/tedlium/s5_r2/local/nnet3/tuning.
++
++# It's a little better than the TDNN-only script on dev93, a little
++# worse on eval92.
++
++# steps/info/nnet3_dir_info.pl exp/nnet3/tdnn_lstm1a_sp
++# exp/nnet3/tdnn_lstm1a_sp: num-iters=102 nj=3..10 num-params=8.8M dim=40+100->3413 combine=-0.55->-0.54 loglike:train/valid[67,101,combined]=(-0.63,-0.55,-0.55/-0.71,-0.63,-0.63) accuracy:train/valid[67,101,combined]=(0.80,0.82,0.82/0.76,0.78,0.78)
++
++
++
++# local/nnet3/compare_wer.sh --looped --online exp/nnet3/tdnn1a_sp exp/nnet3/tdnn_lstm1a_sp 2>/dev/null
++# local/nnet3/compare_wer.sh --looped --online exp/nnet3/tdnn1a_sp exp/nnet3/tdnn_lstm1a_sp
++# System                tdnn1a_sp tdnn_lstm1a_sp
++#WER dev93 (tgpr)                9.18      8.54
++#             [looped:]                    8.54
++#             [online:]                    8.57
++#WER dev93 (tg)                  8.59      8.25
++#             [looped:]                    8.21
++#             [online:]                    8.34
++#WER dev93 (big-dict,tgpr)       6.45      6.24
++#             [looped:]                    6.28
++#             [online:]                    6.40
++#WER dev93 (big-dict,fg)         5.83      5.70
++#             [looped:]                    5.70
++#             [online:]                    5.77
++#WER eval92 (tgpr)               6.15      6.52
++#             [looped:]                    6.45
++#             [online:]                    6.56
++#WER eval92 (tg)                 5.55      6.13
++#             [looped:]                    6.08
++#             [online:]                    6.24
++#WER eval92 (big-dict,tgpr)      3.58      3.88
++#             [looped:]                    3.93
++#             [online:]                    3.88
++#WER eval92 (big-dict,fg)        2.98      3.38
++#             [looped:]                    3.47
++#             [online:]                    3.53
++# Final train prob        -0.7200   -0.5492
++# Final valid prob        -0.8834   -0.6343
++# Final train acc          0.7762    0.8154
++# Final valid acc          0.7301    0.7849
++
++
++set -e -o pipefail
++
++# First the options that are passed through to run_ivector_common.sh
++# (some of which are also used in this script directly).
++stage=0
++nj=30
++train_set=train_si284
++test_sets="test_dev93 test_eval92"
++gmm=tri4b        # this is the source gmm-dir that we'll use for alignments; it
++                 # should have alignments for the specified training data.
++num_threads_ubm=32
++nnet3_affix=       # affix for exp dirs, e.g. it was _cleaned in tedlium.
++
++# Options which are not passed through to run_ivector_common.sh
++affix=_dcae  #affix for TDNN+LSTM directory e.g. "1a" or "1b", in case we change the configuration.
++common_egs_dir=
++reporting_email=
++
++# LSTM options
++train_stage=-10
++label_delay=5
++
++# training chunk-options
++chunk_width=40,30,20
++chunk_left_context=40
++chunk_right_context=0
++
++# training options
++srand=0
++remove_egs=true
++
++#decode options
++test_online_decoding=false  # if true, it will run the last decoding stage.
++
++#weight for dcae
++weight=0.9999999999
++weight_ae=0.0000000001
++
++. ./cmd.sh
++. ./path.sh
++. ./utils/parse_options.sh
++
++if ! cuda-compiled; then
++  cat <<EOF && exit 1
++This script is intended to be used with GPUs but you have not compiled Kaldi with CUDA
++If you want to use GPUs (and have them), go to src/, and configure and make on a machine
++where "nvcc" is installed.
++EOF
++fi
++
++local/nnet3/run_ivector_common.sh \
++  --stage $stage --nj $nj \
++  --train-set $train_set --gmm $gmm \
++  --num-threads-ubm $num_threads_ubm \
++  --nnet3-affix "$nnet3_affix"
++
++
++
++gmm_dir=exp/${gmm}
++ali_dir=exp/${gmm}_ali_${train_set}_sp
++lang=data/lang
++dir=exp/nnet3${nnet3_affix}/tdnn_lstm${affix}_sp/${weight_ae}
++train_data_dir=data/${train_set}_sp_hires
++train_ivector_dir=exp/nnet3${nnet3_affix}/ivectors_${train_set}_sp_hires
++
++for f in $train_data_dir/feats.scp $train_ivector_dir/ivector_online.scp \
++    $gmm_dir/{graph_tgpr,graph_bd_tgpr}/HCLG.fst \
++    $ali_dir/ali.1.gz $gmm_dir/final.mdl; do
++  [ ! -f $f ] && echo "$0: expected file $f to exist" && exit 1
++done
++
++if [ $stage -le 12 ]; then
++  mkdir -p $dir
++  echo "$0: creating neural net configs using the xconfig parser";
++
++  num_targets=$(tree-info $ali_dir/tree |grep num-pdfs|awk '{print $2}')
++
++  mkdir -p $dir/configs
++  cat <<EOF > $dir/configs/network.xconfig
++  input dim=100 name=ivector
++  input dim=40 name=input
++
++  # please note that it is important to have input layer with the name=input
++  # as the layer immediately preceding the fixed-affine-layer to enable
++  # the use of short notation for the descriptor
++  fixed-affine-layer name=lda input=Append(-2,-1,0,1,2,ReplaceIndex(ivector, t, 0)) affine-transform-file=$dir/configs/lda.mat
++
++  # the first splicing is moved before the lda layer, so no splicing here
++  relu-renorm-layer name=tdnn1 dim=520
++  relu-renorm-layer name=tdnn2 dim=520 input=Append(-1,0,1)
++  fast-lstmp-layer name=lstm1 cell-dim=520 recurrent-projection-dim=130 non-recurrent-projection-dim=130 decay-time=20 delay=-3
++  relu-renorm-layer name=tdnn3 dim=520 input=Append(-3,0,3)
++  relu-renorm-layer name=tdnn4 dim=520 input=Append(-3,0,3)
++  fast-lstmp-layer name=lstm2 cell-dim=520 recurrent-projection-dim=130 non-recurrent-projection-dim=130 decay-time=20 delay=-3
++  relu-renorm-layer name=tdnn5 dim=520 input=Append(-3,0,3)
++  relu-renorm-layer name=tdnn6 dim=520 input=Append(-3,0,3)
++  fast-lstmp-layer name=lstm3 cell-dim=520 recurrent-projection-dim=130 non-recurrent-projection-dim=130 decay-time=20 delay=-3
++
++  relu-renorm-layer name=tdnn7 dim=520
++  relu-renorm-layer name=tdnn8 input=lstm3 dim=520
++  relu-renorm-layer name=tdnn9 input=Append(0, tdnn7) dim=520
++  relu-renorm-layer name=tdnn10 dim=520
++  relu-renorm-layer name=tdnn11 dim=520
++  relu-renorm-layer name=tdnn12 dim=520
++
++  output-layer name=output input=tdnn7 output-delay=$label_delay dim=$num_targets max-change=1.5 learning-rate-factor=$weight
++  output-layer name=output_ae include-log-softmax=false learning-rate-factor=$weight_ae max-change=1.0 objective-type=quadratic input=tdnn12 output-delay=$label_delay dim=40
++
++EOF
++  steps/nnet3/xconfig_to_configs.py --xconfig-file $dir/configs/network.xconfig --config-dir $dir/configs/
++fi
++
++
++if [ $stage -le 13 ]; then
++  if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d $dir/egs/storage ]; then
++    utils/create_split_dir.pl \
++     /export/b0{3,4,5,6}/$USER/kaldi-data/egs/tedlium-$(date +'%m_%d_%H_%M')/s5_r2/$dir/egs/storage $dir/egs/storage
++  fi
++
++  steps/nnet3/train_dcae_rnn.py --stage=$train_stage \
++    --cmd="$decode_cmd" \
++    --feat.online-ivector-dir=$train_ivector_dir \
++    --feat.cmvn-opts="--norm-means=false --norm-vars=false" \
++    --trainer.srand=$srand \
++    --trainer.max-param-change=2.0 \
++    --trainer.num-epochs=6 \
++    --trainer.deriv-truncate-margin=10 \
++    --trainer.samples-per-iter=20000 \
++    --trainer.optimization.num-jobs-initial=2 \
++    --trainer.optimization.num-jobs-final=2 \
++    --trainer.num-jobs-compute-prior=2 \
++    --trainer.optimization.initial-effective-lrate=0.0003 \
++    --trainer.optimization.final-effective-lrate=0.00003 \
++    --trainer.optimization.shrink-value 0.99 \
++    --trainer.rnn.num-chunk-per-minibatch=128,64 \
++    --trainer.optimization.momentum=0.5 \
++    --egs.chunk-width=$chunk_width \
++    --egs.chunk-left-context=$chunk_left_context \
++    --egs.chunk-right-context=$chunk_right_context \
++    --egs.chunk-left-context-initial=0 \
++    --egs.chunk-right-context-final=0 \
++    --egs.dir="$common_egs_dir" \
++    --cleanup.remove-egs=$remove_egs \
++    --use-gpu=wait \
++    --feat-dir=$train_data_dir \
++    --ali-dir=$ali_dir \
++    --lang=$lang \
++    --reporting.email="$reporting_email" \
++    --dir=$dir  || exit 1;
++fi
++
++if [ $stage -le 14 ]; then
++  frames_per_chunk=$(echo $chunk_width | cut -d, -f1)
++  rm $dir/.error 2>/dev/null || true
++
++  for data in $test_sets; do
++    (
++      frames_per_chunk=$(echo $chunk_width | cut -d, -f1)
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/nnet3/decode.sh \
++          --extra-left-context $chunk_left_context \
++          --extra-right-context $chunk_right_context \
++          --extra-left-context-initial 0 \
++          --extra-right-context-final 0 \
++          --frames-per-chunk $frames_per_chunk \
++          --nj $nj --cmd "$decode_cmd"  --num-threads 4 \
++          --online-ivector-dir exp/nnet3${nnet3_affix}/ivectors_${data}_hires \
++          $graph_dir data/${data}_hires ${dir}/decode_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}/decode_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}/decode_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++if [ $stage -le 15 ]; then
++  # 'looped' decoding.
++  # note: you should NOT do this decoding step for setups that have bidirectional
++  # recurrence, like BLSTMs-- it doesn't make sense and will give bad results.
++  # we didn't write a -parallel version of this program yet,
++  # so it will take a bit longer as the --num-threads option is not supported.
++  # we just hardcode the --frames-per-chunk option as it doesn't have to
++  # match any value used in training, and it won't affect the results (unlike
++  # regular decoding).
++  rm $dir/.error 2>/dev/null || true
++
++  for data in $test_sets; do
++    (
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/nnet3/decode_looped.sh \
++          --frames-per-chunk 30 \
++          --nj $nj --cmd "$decode_cmd" \
++          --online-ivector-dir exp/nnet3${nnet3_affix}/ivectors_${data}_hires \
++          $graph_dir data/${data}_hires ${dir}/decode_looped_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}/decode_looped_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}/decode_looped_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++if $test_online_decoding && [ $stage -le 16 ]; then
++  # note: if the features change (e.g. you add pitch features), you will have to
++  # change the options of the following command line.
++  steps/online/nnet3/prepare_online_decoding.sh \
++    --mfcc-config conf/mfcc_hires.conf \
++    $lang exp/nnet3${nnet3_affix}/extractor ${dir} ${dir}_online
++
++  rm $dir/.error 2>/dev/null || true
++
++  for data in $test_sets; do
++    (
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      # note: we just give it "data/${data}" as it only uses the wav.scp, the
++      # feature type does not matter.
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/online/nnet3/decode.sh \
++          --nj $nj --cmd "$decode_cmd" --num-threads 2 \
++          $graph_dir data/${data} ${dir}_online/decode_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}_online/decode_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}_online/decode_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++
++exit 0;
+diff --git a/egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae_U.sh b/egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae_U.sh
+new file mode 100755
+index 0000000..4bfe774
+--- /dev/null
++++ b/egs/wsj/s5/local/nnet3/run_tdnn_lstm_dcae_U.sh
+@@ -0,0 +1,300 @@
++#!/bin/bash
++
++
++# run_tdnn_lstm_1a.sh is a TDNN+LSTM system.  Compare with the TDNN
++# system in run_tdnn_1a.sh.  Configuration is similar to
++# the same-named script run_tdnn_lstm_1a.sh in
++# egs/tedlium/s5_r2/local/nnet3/tuning.
++
++# It's a little better than the TDNN-only script on dev93, a little
++# worse on eval92.
++
++# steps/info/nnet3_dir_info.pl exp/nnet3/tdnn_lstm1a_sp
++# exp/nnet3/tdnn_lstm1a_sp: num-iters=102 nj=3..10 num-params=8.8M dim=40+100->3413 combine=-0.55->-0.54 loglike:train/valid[67,101,combined]=(-0.63,-0.55,-0.55/-0.71,-0.63,-0.63) accuracy:train/valid[67,101,combined]=(0.80,0.82,0.82/0.76,0.78,0.78)
++
++
++
++# local/nnet3/compare_wer.sh --looped --online exp/nnet3/tdnn1a_sp exp/nnet3/tdnn_lstm1a_sp 2>/dev/null
++# local/nnet3/compare_wer.sh --looped --online exp/nnet3/tdnn1a_sp exp/nnet3/tdnn_lstm1a_sp
++# System                tdnn1a_sp tdnn_lstm1a_sp
++#WER dev93 (tgpr)                9.18      8.54
++#             [looped:]                    8.54
++#             [online:]                    8.57
++#WER dev93 (tg)                  8.59      8.25
++#             [looped:]                    8.21
++#             [online:]                    8.34
++#WER dev93 (big-dict,tgpr)       6.45      6.24
++#             [looped:]                    6.28
++#             [online:]                    6.40
++#WER dev93 (big-dict,fg)         5.83      5.70
++#             [looped:]                    5.70
++#             [online:]                    5.77
++#WER eval92 (tgpr)               6.15      6.52
++#             [looped:]                    6.45
++#             [online:]                    6.56
++#WER eval92 (tg)                 5.55      6.13
++#             [looped:]                    6.08
++#             [online:]                    6.24
++#WER eval92 (big-dict,tgpr)      3.58      3.88
++#             [looped:]                    3.93
++#             [online:]                    3.88
++#WER eval92 (big-dict,fg)        2.98      3.38
++#             [looped:]                    3.47
++#             [online:]                    3.53
++# Final train prob        -0.7200   -0.5492
++# Final valid prob        -0.8834   -0.6343
++# Final train acc          0.7762    0.8154
++# Final valid acc          0.7301    0.7849
++
++
++set -e -o pipefail
++
++# First the options that are passed through to run_ivector_common.sh
++# (some of which are also used in this script directly).
++stage=0
++nj=30
++train_set=train_si284
++test_sets="test_dev93 test_eval92"
++gmm=tri4b        # this is the source gmm-dir that we'll use for alignments; it
++                 # should have alignments for the specified training data.
++num_threads_ubm=32
++nnet3_affix=       # affix for exp dirs, e.g. it was _cleaned in tedlium.
++
++# Options which are not passed through to run_ivector_common.sh
++affix=_dcae_U  #affix for TDNN+LSTM directory e.g. "1a" or "1b", in case we change the configuration.
++common_egs_dir=
++reporting_email=
++
++# LSTM options
++train_stage=-10
++label_delay=5
++
++# training chunk-options
++chunk_width=40,30,20
++chunk_left_context=40
++chunk_right_context=0
++
++# training options
++srand=0
++remove_egs=true
++
++#decode options
++test_online_decoding=false  # if true, it will run the last decoding stage.
++
++#weight for dcae
++weight=0.999999999
++weight_ae=0.000000001
++
++. ./cmd.sh
++. ./path.sh
++. ./utils/parse_options.sh
++
++if ! cuda-compiled; then
++  cat <<EOF && exit 1
++This script is intended to be used with GPUs but you have not compiled Kaldi with CUDA
++If you want to use GPUs (and have them), go to src/, and configure and make on a machine
++where "nvcc" is installed.
++EOF
++fi
++
++local/nnet3/run_ivector_common.sh \
++  --stage $stage --nj $nj \
++  --train-set $train_set --gmm $gmm \
++  --num-threads-ubm $num_threads_ubm \
++  --nnet3-affix "$nnet3_affix"
++
++
++
++gmm_dir=exp/${gmm}
++ali_dir=exp/${gmm}_ali_${train_set}_sp
++lang=data/lang
++dir=exp/nnet3${nnet3_affix}/tdnn_lstm${affix}_sp/${weight_ae}
++train_data_dir=data/${train_set}_sp_hires
++train_ivector_dir=exp/nnet3${nnet3_affix}/ivectors_${train_set}_sp_hires
++
++for f in $train_data_dir/feats.scp $train_ivector_dir/ivector_online.scp \
++    $gmm_dir/{graph_tgpr,graph_bd_tgpr}/HCLG.fst \
++    $ali_dir/ali.1.gz $gmm_dir/final.mdl; do
++  [ ! -f $f ] && echo "$0: expected file $f to exist" && exit 1
++done
++
++if [ $stage -le 12 ]; then
++  mkdir -p $dir
++  echo "$0: creating neural net configs using the xconfig parser";
++
++  num_targets=$(tree-info $ali_dir/tree |grep num-pdfs|awk '{print $2}')
++
++  mkdir -p $dir/configs
++  cat <<EOF > $dir/configs/network.xconfig
++  input dim=100 name=ivector
++  input dim=40 name=input
++
++  # please note that it is important to have input layer with the name=input
++  # as the layer immediately preceding the fixed-affine-layer to enable
++  # the use of short notation for the descriptor
++  fixed-affine-layer name=lda input=Append(-2,-1,0,1,2,ReplaceIndex(ivector, t, 0)) affine-transform-file=$dir/configs/lda.mat
++
++  # the first splicing is moved before the lda layer, so no splicing here
++  relu-renorm-layer name=tdnn1 dim=520
++  relu-renorm-layer name=tdnn2 dim=520 input=Append(-1,0,1)
++  fast-lstmp-layer name=lstm1 cell-dim=520 recurrent-projection-dim=130 non-recurrent-projection-dim=130 decay-time=20 delay=-3
++  relu-renorm-layer name=tdnn3 dim=520 input=Append(-3,0,3)
++  relu-renorm-layer name=tdnn4 dim=520 input=Append(-3,0,3)
++  fast-lstmp-layer name=lstm2 cell-dim=520 recurrent-projection-dim=130 non-recurrent-projection-dim=130 decay-time=20 delay=-3
++  relu-renorm-layer name=tdnn5 dim=520 input=Append(-3,0,3)
++  relu-renorm-layer name=tdnn6 dim=520 input=Append(-3,0,3)
++  fast-lstmp-layer name=lstm3 cell-dim=520 recurrent-projection-dim=130 non-recurrent-projection-dim=130 decay-time=20 delay=-3
++
++  relu-renorm-layer name=tdnn7 dim=520
++  relu-renorm-layer name=tdnn8 input=lstm3 dim=520
++  relu-renorm-layer name=tdnn9 input=Append(0, tdnn7) dim=520
++  relu-renorm-layer name=tdnn10 dim=520
++  relu-renorm-layer name=tdnn11 input=Sum(0, Scale(0.3, tdnn2)) dim=520
++  relu-renorm-layer name=tdnn12 input=Sum(0, Scale(0.3, tdnn1)) dim=520
++
++  output-layer name=output input=tdnn7 output-delay=$label_delay dim=$num_targets max-change=1.5 learning-rate-factor=$weight
++  output-layer name=output_ae include-log-softmax=false learning-rate-factor=$weight_ae max-change=1.0 objective-type=quadratic input=tdnn12 output-delay=$label_delay dim=40
++
++EOF
++  steps/nnet3/xconfig_to_configs.py --xconfig-file $dir/configs/network.xconfig --config-dir $dir/configs/
++fi
++
++
++if [ $stage -le 13 ]; then
++  if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d $dir/egs/storage ]; then
++    utils/create_split_dir.pl \
++     /export/b0{3,4,5,6}/$USER/kaldi-data/egs/tedlium-$(date +'%m_%d_%H_%M')/s5_r2/$dir/egs/storage $dir/egs/storage
++  fi
++
++  steps/nnet3/train_dcae_rnn.py --stage=$train_stage \
++    --cmd="$decode_cmd" \
++    --feat.online-ivector-dir=$train_ivector_dir \
++    --feat.cmvn-opts="--norm-means=false --norm-vars=false" \
++    --trainer.srand=$srand \
++    --trainer.max-param-change=2.0 \
++    --trainer.num-epochs=6 \
++    --trainer.deriv-truncate-margin=10 \
++    --trainer.samples-per-iter=20000 \
++    --trainer.optimization.num-jobs-initial=2 \
++    --trainer.optimization.num-jobs-final=2 \
++    --trainer.num-jobs-compute-prior=2 \
++    --trainer.optimization.initial-effective-lrate=0.0003 \
++    --trainer.optimization.final-effective-lrate=0.00003 \
++    --trainer.optimization.shrink-value 0.99 \
++    --trainer.rnn.num-chunk-per-minibatch=128,64 \
++    --trainer.optimization.momentum=0.5 \
++    --egs.chunk-width=$chunk_width \
++    --egs.chunk-left-context=$chunk_left_context \
++    --egs.chunk-right-context=$chunk_right_context \
++    --egs.chunk-left-context-initial=0 \
++    --egs.chunk-right-context-final=0 \
++    --egs.dir="$common_egs_dir" \
++    --cleanup.remove-egs=$remove_egs \
++    --use-gpu=wait \
++    --feat-dir=$train_data_dir \
++    --ali-dir=$ali_dir \
++    --lang=$lang \
++    --reporting.email="$reporting_email" \
++    --dir=$dir  || exit 1;
++fi
++
++if [ $stage -le 14 ]; then
++  frames_per_chunk=$(echo $chunk_width | cut -d, -f1)
++  rm $dir/.error 2>/dev/null || true
++
++  for data in $test_sets; do
++    (
++      frames_per_chunk=$(echo $chunk_width | cut -d, -f1)
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/nnet3/decode.sh \
++          --extra-left-context $chunk_left_context \
++          --extra-right-context $chunk_right_context \
++          --extra-left-context-initial 0 \
++          --extra-right-context-final 0 \
++          --frames-per-chunk $frames_per_chunk \
++          --nj $nj --cmd "$decode_cmd"  --num-threads 4 \
++          --online-ivector-dir exp/nnet3${nnet3_affix}/ivectors_${data}_hires \
++          $graph_dir data/${data}_hires ${dir}/decode_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}/decode_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}/decode_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++if [ $stage -le 15 ]; then
++  # 'looped' decoding.
++  # note: you should NOT do this decoding step for setups that have bidirectional
++  # recurrence, like BLSTMs-- it doesn't make sense and will give bad results.
++  # we didn't write a -parallel version of this program yet,
++  # so it will take a bit longer as the --num-threads option is not supported.
++  # we just hardcode the --frames-per-chunk option as it doesn't have to
++  # match any value used in training, and it won't affect the results (unlike
++  # regular decoding).
++  rm $dir/.error 2>/dev/null || true
++
++  for data in $test_sets; do
++    (
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/nnet3/decode_looped.sh \
++          --frames-per-chunk 30 \
++          --nj $nj --cmd "$decode_cmd" \
++          --online-ivector-dir exp/nnet3${nnet3_affix}/ivectors_${data}_hires \
++          $graph_dir data/${data}_hires ${dir}/decode_looped_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}/decode_looped_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}/decode_looped_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++if $test_online_decoding && [ $stage -le 16 ]; then
++  # note: if the features change (e.g. you add pitch features), you will have to
++  # change the options of the following command line.
++  steps/online/nnet3/prepare_online_decoding.sh \
++    --mfcc-config conf/mfcc_hires.conf \
++    $lang exp/nnet3${nnet3_affix}/extractor ${dir} ${dir}_online
++
++  rm $dir/.error 2>/dev/null || true
++
++  for data in $test_sets; do
++    (
++      data_affix=$(echo $data | sed s/test_//)
++      nj=$(wc -l <data/${data}_hires/spk2utt)
++      # note: we just give it "data/${data}" as it only uses the wav.scp, the
++      # feature type does not matter.
++      for lmtype in tgpr bd_tgpr; do
++        graph_dir=$gmm_dir/graph_${lmtype}
++        steps/online/nnet3/decode.sh \
++          --nj $nj --cmd "$decode_cmd" --num-threads 2 \
++          $graph_dir data/${data} ${dir}_online/decode_${lmtype}_${data_affix} || exit 1
++      done
++      steps/lmrescore.sh --cmd "$decode_cmd" data/lang_test_{tgpr,tg} \
++        data/${data}_hires ${dir}_online/decode_{tgpr,tg}_${data_affix} || exit 1
++      steps/lmrescore_const_arpa.sh --cmd "$decode_cmd" \
++        data/lang_test_bd_{tgpr,fgconst} \
++       data/${data}_hires ${dir}_online/decode_${lmtype}_${data_affix}{,_fg} || exit 1
++    ) || touch $dir/.error &
++  done
++  wait
++  [ -f $dir/.error ] && echo "$0: there was a problem while decoding" && exit 1
++fi
++
++
++exit 0;
+diff --git a/egs/wsj/s5/steps/libs/nnet3/xconfig/basic_layers.py b/egs/wsj/s5/steps/libs/nnet3/xconfig/basic_layers.py
+index 7846c98..8c081a5 100644
+--- a/egs/wsj/s5/steps/libs/nnet3/xconfig/basic_layers.py
++++ b/egs/wsj/s5/steps/libs/nnet3/xconfig/basic_layers.py
+@@ -1008,6 +1008,8 @@ class XconfigFixedAffineLayer(XconfigLayerBase):
+                 # layer.  This will be used to accumulate stats to learn the LDA transform.
+                 line = 'output-node name=output input={0}'.format(descriptor_final_string)
+                 ans.append(('init', line))
++		line = 'output-node name=output_ae input={0}'.format(descriptor_final_string)
++		ans.append(('init', line))
+ 
+         # write the 'real' component to final.config
+         line = 'component name={0} type=FixedAffineComponent matrix={1}'.format(
+diff --git a/egs/wsj/s5/steps/nnet3/get_egs_dcae.sh b/egs/wsj/s5/steps/nnet3/get_egs_dcae.sh
+new file mode 100755
+index 0000000..eb488a9
+--- /dev/null
++++ b/egs/wsj/s5/steps/nnet3/get_egs_dcae.sh
+@@ -0,0 +1,494 @@
++#!/bin/bash
++
++# Copyright 2012-2016 Johns Hopkins University (Author: Daniel Povey).  Apache 2.0.
++#
++# This script, which will generally be called from other neural-net training
++# scripts, extracts the training examples used to train the neural net (and also
++# the validation examples used for diagnostics), and puts them in separate archives.
++#
++# This script dumps egs with several frames of labels, controlled by the
++# frames_per_eg config variable (default: 8).  This takes many times less disk
++# space because typically we have 4 to 7 frames of context on the left and
++# right, and this ends up getting shared.  This is at the expense of slightly
++# higher disk I/O while training.
++
++set -o pipefail
++trap "" PIPE
++
++# Begin configuration section.
++cmd=run.pl
++frame_subsampling_factor=1
++frames_per_eg=8   # number of frames of labels per example.  more->less disk space and
++                  # less time preparing egs, but more I/O during training.
++                  # Note: may in general be a comma-separated string of alternative
++                  # durations (more useful when using large chunks, e.g. for BLSTMs);
++                  # the first one (the principal num-frames) is preferred.
++left_context=4    # amount of left-context per eg (i.e. extra frames of input features
++                  # not present in the output supervision).
++right_context=4   # amount of right-context per eg.
++left_context_initial=-1    # if >=0, left-context for first chunk of an utterance
++right_context_final=-1     # if >=0, right-context for last chunk of an utterance
++compress=true   # set this to false to disable compression (e.g. if you want to see whether
++                # results are affected).
++
++num_utts_subset=300     # number of utterances in validation and training
++                        # subsets used for shrinkage and diagnostics.
++num_valid_frames_combine=0 # #valid frames for combination weights at the very end.
++num_train_frames_combine=60000 # # train frames for the above.
++num_frames_diagnostic=10000 # number of frames for "compute_prob" jobs
++samples_per_iter=400000 # this is the target number of egs in each archive of egs
++                        # (prior to merging egs).  We probably should have called
++                        # it egs_per_iter. This is just a guideline; it will pick
++                        # a number that divides the number of samples in the
++                        # entire data.
++
++stage=0
++nj=6         # This should be set to the maximum number of jobs you are
++             # comfortable to run in parallel; you can increase it if your disk
++             # speed is greater and you have more machines.
++srand=0     # rand seed for nnet3-copy-egs and nnet3-shuffle-egs
++online_ivector_dir=  # can be used if we are including speaker information as iVectors.
++cmvn_opts=  # can be used for specifying CMVN options, if feature type is not lda (if lda,
++            # it doesn't make sense to use different options than were used as input to the
++            # LDA transform).  This is used to turn off CMVN in the online-nnet experiments.
++generate_egs_scp=true # If true, it will generate egs.JOB.*.scp per egs archive
++
++#get_egs_dense_targets
++feat_type=raw     # set it to 'lda' to use LDA features.
++target_type=dense # dense to have dense targets, 
++                  # sparse to have posteriors targets
++num_targets=
++deriv_weights_scp=
++valid_left_context=   # amount of left_context for validation egs, typically used in
++                      # recurrent architectures to ensure matched condition with
++                      # training egs
++valid_right_context=  # amount of right_context for validation egs
++reduce_frames_per_eg=true  # If true, this script may reduce the frames_per_eg
++                           # if there is only one archive and even with the
++                           # reduced frames_per_eg, the number of
++                           # samples_per_iter that would result is less than or
++                           # equal to the user-specified value.
++
++echo "$0 $@"  # Print the command line for logging
++
++if [ -f path.sh ]; then . ./path.sh; fi
++. parse_options.sh || exit 1;
++
++if [ $# != 4 ]; then
++  echo "$#"
++  echo "Usage: $0 [opts] <data> <ali-dir> <targets-scp> <egs-dir>"
++  echo " e.g.: $0 data/train exp/tri3_ali data/train/feats.scp exp/tri4_nnet/egs"
++  echo ""
++  echo "Main options (for others, see top of script file)"
++  echo "  --config <config-file>                           # config file containing options"
++  echo "  --nj <nj>                                        # The maximum number of jobs you want to run in"
++  echo "                                                   # parallel (increase this only if you have good disk and"
++  echo "                                                   # network speed).  default=6"
++  echo "  --cmd (utils/run.pl;utils/queue.pl <queue opts>) # how to run jobs."
++  echo "  --samples-per-iter <#samples;400000>             # Target number of egs per archive (option is badly named)"
++  echo "  --frames-per-eg <frames;8>                       # number of frames per eg on disk"
++  echo "                                                   # May be either a single number or a comma-separated list"
++  echo "                                                   # of alternatives (useful when training LSTMs, where the"
++  echo "                                                   # frames-per-eg is the chunk size, to get variety of chunk"
++  echo "                                                   # sizes).  The first in the list is preferred and is used"
++  echo "                                                   # when working out the number of archives etc."
++  echo "  --left-context <int;4>                           # Number of frames on left side to append for feature input"
++  echo "  --right-context <int;4>                          # Number of frames on right side to append for feature input"
++  echo "  --left-context-initial <int;-1>                  # If >= 0, left-context for first chunk of an utterance"
++  echo "  --right-context-final <int;-1>                   # If >= 0, right-context for last chunk of an utterance"
++  echo "  --num-frames-diagnostic <#frames;4000>           # Number of frames used in computing (train,valid) diagnostics"
++  echo "  --num-valid-frames-combine <#frames;10000>       # Number of frames used in getting combination weights at the"
++  echo "                                                   # very end."
++  echo "  --stage <stage|0>                                # Used to run a partially-completed training process from somewhere in"
++  echo "                                                   # the middle."
++
++  exit 1;
++fi
++
++data=$1
++alidir=$2
++targets_scp=$3
++dir=$4
++
++# Check some files.
++[ ! -z "$online_ivector_dir" ] && \
++  extra_files="$online_ivector_dir/ivector_online.scp $online_ivector_dir/ivector_period"
++
++for f in $data/feats.scp $alidir/ali.1.gz $alidir/final.mdl $alidir/tree $targets_scp $extra_files; do
++  [ ! -f $f ] && echo "$0: no such file $f" && exit 1;
++done
++
++sdata=$data/split$nj
++utils/split_data.sh $data $nj
++
++mkdir -p $dir/log $dir/info
++cp $alidir/tree $dir
++
++num_ali_jobs=$(cat $alidir/num_jobs) || exit 1;
++
++
++num_utts=$(cat $data/utt2spk | wc -l)
++if ! [ $num_utts -gt $[$num_utts_subset*4] ]; then
++  echo "$0: number of utterances $num_utts in your training data is too small versus --num-utts-subset=$num_utts_subset"
++  echo "... you probably have so little data that it doesn't make sense to train a neural net."
++  exit 1
++fi
++
++# Get list of validation utterances.
++awk '{print $1}' $data/utt2spk | utils/shuffle_list.pl 2>/dev/null | head -$num_utts_subset \
++    > $dir/valid_uttlist
++
++if [ -f $data/utt2uniq ]; then  # this matters if you use data augmentation.
++  echo "File $data/utt2uniq exists, so augmenting valid_uttlist to"
++  echo "include all perturbed versions of the same 'real' utterances."
++  mv $dir/valid_uttlist $dir/valid_uttlist.tmp
++  utils/utt2spk_to_spk2utt.pl $data/utt2uniq > $dir/uniq2utt
++  cat $dir/valid_uttlist.tmp | utils/apply_map.pl $data/utt2uniq | \
++    sort | uniq | utils/apply_map.pl $dir/uniq2utt | \
++    awk '{for(n=1;n<=NF;n++) print $n;}' | sort  > $dir/valid_uttlist
++  rm $dir/uniq2utt $dir/valid_uttlist.tmp
++fi
++
++awk '{print $1}' $data/utt2spk | utils/filter_scp.pl --exclude $dir/valid_uttlist | \
++   utils/shuffle_list.pl 2>/dev/null | head -$num_utts_subset > $dir/train_subset_uttlist
++
++echo "$0: creating egs.  To ensure they are not deleted later you can do:  touch $dir/.nodelete"
++
++## Set up features.
++echo "$0: feature type is raw"
++
++feats="ark,s,cs:utils/filter_scp.pl --exclude $dir/valid_uttlist $sdata/JOB/feats.scp | apply-cmvn $cmvn_opts --utt2spk=ark:$sdata/JOB/utt2spk scp:$sdata/JOB/cmvn.scp scp:- ark:- |"
++valid_feats="ark,s,cs:utils/filter_scp.pl $dir/valid_uttlist $data/feats.scp | apply-cmvn $cmvn_opts --utt2spk=ark:$data/utt2spk scp:$data/cmvn.scp scp:- ark:- |"
++train_subset_feats="ark,s,cs:utils/filter_scp.pl $dir/train_subset_uttlist $data/feats.scp | apply-cmvn $cmvn_opts --utt2spk=ark:$data/utt2spk scp:$data/cmvn.scp scp:- ark:- |"
++echo $cmvn_opts >$dir/cmvn_opts # caution: the top-level nnet training script should copy this to its own dir now.
++
++if [ ! -z "$online_ivector_dir" ]; then
++  ivector_dim=$(feat-to-dim scp:$online_ivector_dir/ivector_online.scp -) || exit 1;
++  echo $ivector_dim > $dir/info/ivector_dim
++  steps/nnet2/get_ivector_id.sh $online_ivector_dir > $dir/info/final.ie.id || exit 1
++  ivector_period=$(cat $online_ivector_dir/ivector_period) || exit 1;
++  ivector_opts="--online-ivectors=scp:$online_ivector_dir/ivector_online.scp --online-ivector-period=$ivector_period"
++
++  # #from get_egs_dense_targets.sh
++  # ivector_opt="--ivectors='ark,s,cs:utils/filter_scp.pl $sdata/JOB/utt2spk $online_ivector_dir/ivector_online.scp | subsample-feats --n=-$ivector_period scp:- ark:- |'"
++  # valid_ivector_opt="--ivectors='ark,s,cs:utils/filter_scp.pl $dir/valid_uttlist $online_ivector_dir/ivector_online.scp | subsample-feats --n=-$ivector_period scp:- ark:- |'"
++  # train_subset_ivector_opt="--ivectors='ark,s,cs:utils/filter_scp.pl $dir/train_subset_uttlist $online_ivector_dir/ivector_online.scp | subsample-feats --n=-$ivector_period scp:- ark:- |'"
++else
++  ivector_opts=""
++  echo 0 >$dir/info/ivector_dim
++fi
++
++if [ $stage -le 1 ]; then
++  echo "$0: working out number of frames of training data"
++  num_frames=$(steps/nnet2/get_num_frames.sh $data)
++  echo $num_frames > $dir/info/num_frames
++  echo "$0: working out feature dim"
++  feats_one="$(echo $feats | sed s/JOB/1/g)"
++  if feat_dim=$(feat-to-dim "$feats_one" - 2>/dev/null); then
++    echo $feat_dim > $dir/info/feat_dim
++  else # run without redirection to show the error.
++    feat-to-dim "$feats_one" -; exit 1
++  fi
++else
++  num_frames=$(cat $dir/info/num_frames) || exit 1;
++  feat_dim=$(cat $dir/info/feat_dim) || exit 1;
++fi
++
++
++# the first field in frames_per_eg (which is a comma-separated list of numbers)
++# is the 'principal' frames-per-eg, and for purposes of working out the number
++# of archives we assume that this will be the average number of frames per eg.
++frames_per_eg_principal=$(echo $frames_per_eg | cut -d, -f1)
++
++# the + 1 is to round up, not down... we assume it doesn't divide exactly.
++num_archives=$[$num_frames/($frames_per_eg_principal*$samples_per_iter)+1]
++# if [ $num_archives -eq 1 ]; then
++#   echo "*** $0: warning: the --frames-per-eg is too large to generate one archive with"
++#   echo "*** as many as --samples-per-iter egs in it.  Consider reducing --frames-per-eg."
++#   sleep 4
++# fi
++reduced=false
++while $reduce_frames_per_eg && [ $frames_per_eg -gt 1 ] && \
++  [ $[$num_frames/(($frames_per_eg_principal-1)*$samples_per_iter)] -eq 0 ]; do
++  frames_per_eg=$[$frames_per_eg-1]
++  num_archives=1
++  reduced=true
++done
++$reduced && echo "$0: reduced frames_per_eg to $frames_per_eg because amount of data is small."
++
++# We may have to first create a smaller number of larger archives, with number
++# $num_archives_intermediate, if $num_archives is more than the maximum number
++# of open filehandles that the system allows per process (ulimit -n).
++# This sometimes gives a misleading answer as GridEngine sometimes changes that
++# somehow, so we limit it to 512.
++max_open_filehandles=$(ulimit -n) || exit 1
++[ $max_open_filehandles -gt 512 ] && max_open_filehandles=512
++num_archives_intermediate=$num_archives
++archives_multiple=1
++while [ $[$num_archives_intermediate+4] -gt $max_open_filehandles ]; do
++  archives_multiple=$[$archives_multiple+1]
++  num_archives_intermediate=$[$num_archives/$archives_multiple+1];
++done
++# now make sure num_archives is an exact multiple of archives_multiple.
++num_archives=$[$archives_multiple*$num_archives_intermediate]
++
++echo $num_archives >$dir/info/num_archives
++echo $frames_per_eg >$dir/info/frames_per_eg
++# Work out the number of egs per archive
++egs_per_archive=$[$num_frames/($frames_per_eg_principal*$num_archives)]
++! [ $egs_per_archive -le $samples_per_iter ] && \
++  echo "$0: script error: egs_per_archive=$egs_per_archive not <= samples_per_iter=$samples_per_iter" \
++  && exit 1;
++
++echo $egs_per_archive > $dir/info/egs_per_archive
++
++echo "$0: creating $num_archives archives, each with $egs_per_archive egs, with"
++echo "$0:   $frames_per_eg labels per example, and (left,right) context = ($left_context,$right_context)"
++if [ $left_context_initial -ge 0 ] || [ $right_context_final -ge 0 ]; then
++  echo "$0:   ... and (left-context-initial,right-context-final) = ($left_context_initial,$right_context_final)"
++fi
++
++
++
++if [ -e $dir/storage ]; then
++  # Make soft links to storage directories, if distributing this way..  See
++  # utils/create_split_dir.pl.
++  echo "$0: creating data links"
++  utils/create_data_link.pl $(for x in $(seq $num_archives); do echo $dir/egs.$x.ark; done)
++  for x in $(seq $num_archives_intermediate); do
++    utils/create_data_link.pl $(for y in $(seq $nj); do echo $dir/egs_orig.$y.$x.ark; done)
++  done
++fi
++
++if [ $stage -le 2 ]; then
++  echo "$0: copying data alignments"
++  for id in $(seq $num_ali_jobs); do gunzip -c $alidir/ali.$id.gz; done | \
++    copy-int-vector ark:- ark,scp:$dir/ali.ark,$dir/ali.scp || exit 1;
++fi
++
++egs_opts="--left-context=$left_context --right-context=$right_context --compress=$compress --num-frames=$frames_per_eg"
++[ $left_context_initial -ge 0 ] && egs_opts="$egs_opts --left-context-initial=$left_context_initial"
++[ $right_context_final -ge 0 ] && egs_opts="$egs_opts --right-context-final=$right_context_final"
++
++[ ! -z "$deriv_weights_scp" ] && egs_opts="$egs_opts --deriv-weights-rspecifier=scp:$deriv_weights_scp"
++
++echo $left_context > $dir/info/left_context
++echo $right_context > $dir/info/right_context
++echo $left_context_initial > $dir/info/left_context_initial
++echo $right_context_final > $dir/info/right_context_final
++
++
++num_pdfs=$(tree-info --print-args=false $alidir/tree | grep num-pdfs | awk '{print $2}')
++
++# # from get_egs_dense_targets
++# egs_opts="--left-context=$left_context --right-context=$right_context --compress=$compress"
++# [ ! -z "$deriv_weights_scp" ] && egs_opts="$egs_opts --deriv-weights-rspecifier=scp:$deriv_weights_scp"
++# [ -z $valid_left_context ] &&  valid_left_context=$left_context;
++# [ -z $valid_right_context ] &&  valid_right_context=$right_context;
++# valid_egs_opts="--left-context=$valid_left_context --right-context=$valid_right_context --compress=$compress"
++# echo $left_context > $dir/info/left_context
++# echo $right_context > $dir/info/right_context
++if [ $target_type == "dense" ]; then
++  num_targets=$(feat-to-dim "scp:$targets_scp" - 2>/dev/null) || exit 1
++else
++  if [ -z "$num_targets" ]; then
++    echo "$0: num-targets is not set" 
++    exit 1
++  fi
++fi
++
++for n in `seq $nj`; do
++  utils/filter_scp.pl $sdata/$n/utt2spk $targets_scp > $dir/targets.$n.scp
++done
++targets_scp_split=$dir/targets.JOB.scp
++case $target_type in
++  "dense") 
++    # get_egs_program="nnet3-get-egs-dense-targets --num-targets=$num_targets"
++    targets="ark:utils/filter_scp.pl --exclude $dir/valid_uttlist $targets_scp_split | copy-feats scp:- ark:- |"
++    valid_targets="ark:utils/filter_scp.pl $dir/valid_uttlist $targets_scp | copy-feats scp:- ark:- |"
++    train_subset_targets="ark:utils/filter_scp.pl $dir/train_subset_uttlist $targets_scp | copy-feats scp:- ark:- |"
++    ;;
++  # "sparse")
++  #   get_egs_program="nnet3-get-egs --num-pdfs=$num_targets"
++  #   targets="ark:utils/filter_scp.pl --exclude $dir/valid_uttlist $targets_scp_split | ali-to-post scp:- ark:- |"
++  #   valid_targets="ark:utils/filter_scp.pl $dir/valid_uttlist $targets_scp | ali-to-post scp:- ark:- |" \
++  #   train_subset_targets="ark:utils/filter_scp.pl $dir/train_subset_uttlist $targets_scp | ali-to-post scp:- ark:- |"
++  #   ;;
++  default)
++    echo "$0: Unknown --target-type $target_type. Choices are dense and sparse"
++    exit 1
++esac
++
++
++
++if [ $stage -le 3 ]; then
++  echo "$0: Getting validation and training subset examples."
++  rm $dir/.error 2>/dev/null
++  echo "$0: ... extracting validation and training-subset alignments."
++
++
++  # do the filtering just once, as ali.scp may be long.
++  utils/filter_scp.pl <(cat $dir/valid_uttlist $dir/train_subset_uttlist) \
++    <$dir/ali.scp >$dir/ali_special.scp
++
++  $cmd $dir/log/create_valid_subset.log \
++    utils/filter_scp.pl $dir/valid_uttlist $dir/ali_special.scp \| \
++    ali-to-pdf $alidir/final.mdl scp:- ark:- \| \
++    ali-to-post ark:- ark:- \| \
++    nnet3-get-egs-dcae --num-pdfs=$num_pdfs --num-targets=$num_targets --frame-subsampling-factor=$frame_subsampling_factor \
++      $ivector_opts $egs_opts "$valid_feats" \
++      ark,s,cs:- \
++      "$valid_targets" \
++      "ark:$dir/valid_all.egs" || touch $dir/.error &
++  $cmd $dir/log/create_train_subset.log \
++    utils/filter_scp.pl $dir/train_subset_uttlist $dir/ali_special.scp \| \
++    ali-to-pdf $alidir/final.mdl scp:- ark:- \| \
++    ali-to-post ark:- ark:- \| \
++    nnet3-get-egs-dcae --num-pdfs=$num_pdfs --num-targets=$num_targets --frame-subsampling-factor=$frame_subsampling_factor \
++      $ivector_opts $egs_opts "$train_subset_feats" \
++      ark,s,cs:- \
++      "$train_subset_targets" \
++      "ark:$dir/train_subset_all.egs" || touch $dir/.error &
++  wait;
++  [ -f $dir/.error ] && echo "Error detected while creating train/valid egs" && exit 1
++  echo "... Getting subsets of validation examples for diagnostics and combination."
++  if $generate_egs_scp; then
++    valid_diagnostic_output="ark,scp:$dir/valid_diagnostic.egs,$dir/valid_diagnostic.scp"
++    train_diagnostic_output="ark,scp:$dir/train_diagnostic.egs,$dir/train_diagnostic.scp"
++  else
++    valid_diagnostic_output="ark:$dir/valid_diagnostic.egs"
++    train_diagnostic_output="ark:$dir/train_diagnostic.egs"
++  fi
++  $cmd $dir/log/create_valid_subset_combine.log \
++    nnet3-subset-egs --n=$[$num_valid_frames_combine/$frames_per_eg_principal] ark:$dir/valid_all.egs \
++      ark:$dir/valid_combine.egs || touch $dir/.error &
++  $cmd $dir/log/create_valid_subset_diagnostic.log \
++    nnet3-subset-egs --n=$[$num_frames_diagnostic/$frames_per_eg_principal] ark:$dir/valid_all.egs \
++    $valid_diagnostic_output || touch $dir/.error &
++
++  $cmd $dir/log/create_train_subset_combine.log \
++    nnet3-subset-egs --n=$[$num_train_frames_combine/$frames_per_eg_principal] ark:$dir/train_subset_all.egs \
++      ark:$dir/train_combine.egs || touch $dir/.error &
++  $cmd $dir/log/create_train_subset_diagnostic.log \
++    nnet3-subset-egs --n=$[$num_frames_diagnostic/$frames_per_eg_principal] ark:$dir/train_subset_all.egs \
++    $train_diagnostic_output || touch $dir/.error &
++  wait
++  sleep 5  # wait for file system to sync.
++  cat $dir/valid_combine.egs $dir/train_combine.egs > $dir/combine.egs
++  if $generate_egs_scp; then
++    cat $dir/valid_combine.egs $dir/train_combine.egs  | \
++    nnet3-copy-egs ark:- ark,scp:$dir/combine.egs,$dir/combine.scp
++    rm $dir/{train,valid}_combine.scp
++  else
++    cat $dir/valid_combine.egs $dir/train_combine.egs > $dir/combine.egs
++  fi
++  for f in $dir/{combine,train_diagnostic,valid_diagnostic}.egs; do
++    [ ! -s $f ] && echo "No examples in file $f" && exit 1;
++  done
++  rm $dir/valid_all.egs $dir/train_subset_all.egs $dir/{train,valid}_combine.egs
++fi
++
++if [ $stage -le 4 ]; then
++  # create egs_orig.*.*.ark; the first index goes to $nj,
++  # the second to $num_archives_intermediate.
++
++  egs_list=
++  for n in $(seq $num_archives_intermediate); do
++    egs_list="$egs_list ark:$dir/egs_orig.JOB.$n.ark"
++  done
++  echo "$0: Generating training examples on disk"
++  # The examples will go round-robin to egs_list.
++  $cmd JOB=1:$nj $dir/log/get_egs.JOB.log \
++    nnet3-get-egs-dcae --num-pdfs=$num_pdfs --num-targets=$num_targets --frame-subsampling-factor=$frame_subsampling_factor \
++    $ivector_opts $egs_opts "$feats" \
++    "ark,s,cs:filter_scp.pl $sdata/JOB/utt2spk $dir/ali.scp | ali-to-pdf $alidir/final.mdl scp:- ark:- | ali-to-post ark:- ark:- |" "$targets" \
++    ark:- \| \
++    nnet3-copy-egs --random=true --srand=\$[JOB+$srand] ark:- $egs_list || exit 1;
++fi
++
++if [ $stage -le 5 ]; then
++  echo "$0: recombining and shuffling order of archives on disk"
++  # combine all the "egs_orig.*.JOB.scp" (over the $nj splits of the data) and
++  # shuffle the order, writing to the egs.JOB.ark
++
++  # the input is a concatenation over the input jobs.
++  egs_list=
++  for n in $(seq $nj); do
++    egs_list="$egs_list $dir/egs_orig.$n.JOB.ark"
++  done
++
++  if [ $archives_multiple == 1 ]; then # normal case.
++    if $generate_egs_scp; then
++      output_archive="ark,scp:$dir/egs.JOB.ark,$dir/egs.JOB.scp"
++    else
++      output_archive="ark:$dir/egs.JOB.ark"
++    fi
++    $cmd --max-jobs-run $nj JOB=1:$num_archives_intermediate $dir/log/shuffle.JOB.log \
++      nnet3-shuffle-egs --srand=\$[JOB+$srand] "ark:cat $egs_list|" $output_archive  || exit 1;
++
++    if $generate_egs_scp; then
++      #concatenate egs.JOB.scp in single egs.scp
++      rm $dir/egs.scp 2> /dev/null || true
++      for j in $(seq $num_archives_intermediate); do
++        cat $dir/egs.$j.scp || exit 1;
++      done > $dir/egs.scp || exit 1;
++      # for f in $dir/egs.*.scp; do rm $f; done
++    fi
++  else
++    # we need to shuffle the 'intermediate archives' and then split into the
++    # final archives.  we create soft links to manage this splitting, because
++    # otherwise managing the output names is quite difficult (and we don't want
++    # to submit separate queue jobs for each intermediate archive, because then
++    # the --max-jobs-run option is hard to enforce).
++    if $generate_egs_scp; then
++      output_archives="$(for y in $(seq $archives_multiple); do echo ark,scp:$dir/egs.JOB.$y.ark,$dir/egs.JOB.$y.scp; done)"
++    else
++      output_archives="$(for y in $(seq $archives_multiple); do echo ark:$dir/egs.JOB.$y.ark; done)"
++    fi
++    for x in $(seq $num_archives_intermediate); do
++      for y in $(seq $archives_multiple); do
++        archive_index=$[($x-1)*$archives_multiple+$y]
++        # egs.intermediate_archive.{1,2,...}.ark will point to egs.archive.ark
++        ln -sf egs.$archive_index.ark $dir/egs.$x.$y.ark || exit 1
++      done
++    done
++    $cmd --max-jobs-run $nj JOB=1:$num_archives_intermediate $dir/log/shuffle.JOB.log \
++      nnet3-shuffle-egs --srand=\$[JOB+$srand] "ark:cat $egs_list|" ark:- \| \
++      nnet3-copy-egs ark:- $output_archives || exit 1;
++
++    if $generate_egs_scp; then
++      #concatenate egs.JOB.scp in single egs.scp
++      rm $dir/egs.scp 2> /dev/null || true
++      for j in $(seq $num_archives_intermediate); do
++        for y in $(seq $num_archives_intermediate); do
++          cat $dir/egs.$j.$y.scp || exit 1;
++        done
++      done > $dir/egs.scp || exit 1;
++      # for f in $dir/egs.*.*.scp; do rm $f; done
++    fi
++  fi
++fi
++
++if [ $frame_subsampling_factor -ne 1 ]; then
++  echo $frame_subsampling_factor > $dir/info/frame_subsampling_factor
++fi
++
++if [ $stage -le 6 ]; then
++  echo "$0: removing temporary archives"
++  for x in $(seq $nj); do
++    for y in $(seq $num_archives_intermediate); do
++      file=$dir/egs_orig.$x.$y.ark
++      [ -L $file ] && rm $(utils/make_absolute.sh $file)
++      rm $file
++    done
++  done
++  if [ $archives_multiple -gt 1 ]; then
++    # there are some extra soft links that we should delete.
++    for f in $dir/egs.*.*.ark; do rm $f; done
++  fi
++  echo "$0: removing temporary alignments"
++  # Ignore errors below because trans.* might not exist.
++  rm $dir/ali.{ark,scp} 2>/dev/null
++fi
++
++echo "$0: Finished preparing training examples"
+diff --git a/egs/wsj/s5/steps/nnet3/train_dcae_dnn.py b/egs/wsj/s5/steps/nnet3/train_dcae_dnn.py
+new file mode 100755
+index 0000000..980fc84
+--- /dev/null
++++ b/egs/wsj/s5/steps/nnet3/train_dcae_dnn.py
+@@ -0,0 +1,499 @@
++#!/usr/bin/env python
++
++# Copyright 2016    Vijayaditya Peddinti.
++#           2016    Vimal Manohar
++#           2017 Johns Hopkins University (author: Daniel Povey)
++# Apache 2.0.
++
++""" This script is based on steps/nnet3/tdnn/train.sh
++"""
++
++from __future__ import print_function
++import argparse
++import logging
++import os
++import pprint
++import shutil
++import sys
++import traceback
++
++sys.path.insert(0, 'steps')
++import libs.nnet3.train.common as common_train_lib
++import libs.common as common_lib
++import libs.nnet3.train.frame_level_objf as train_lib
++import libs.nnet3.report.log_parse as nnet3_log_parse
++
++
++logger = logging.getLogger('libs')
++logger.setLevel(logging.INFO)
++handler = logging.StreamHandler()
++handler.setLevel(logging.INFO)
++formatter = logging.Formatter("%(asctime)s [%(pathname)s:%(lineno)s - "
++                              "%(funcName)s - %(levelname)s ] %(message)s")
++handler.setFormatter(formatter)
++logger.addHandler(handler)
++logger.info('Starting DNN trainer (train_dnn.py)')
++
++
++def get_args():
++    """ Get args from stdin.
++
++    We add compulsory arguments as named arguments for readability
++
++    The common options are defined in the object
++    libs.nnet3.train.common.CommonParser.parser.
++    See steps/libs/nnet3/train/common.py
++    """
++    parser = argparse.ArgumentParser(
++        description="""Trains a feed forward DNN acoustic model using the
++        cross-entropy objective.  DNNs include simple DNNs, TDNNs and CNNs.""",
++        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++        conflict_handler='resolve',
++        parents=[common_train_lib.CommonParser(include_chunk_context=False).parser])
++
++    # egs extraction options
++    parser.add_argument("--egs.frames-per-eg", type=int, dest='frames_per_eg',
++                        default=8,
++                        help="Number of output labels per example")
++
++    # trainer options
++    parser.add_argument("--trainer.input-model", type=str,
++                        dest='input_model', default=None,
++                        action=common_lib.NullstrToNoneAction,
++                        help="""If specified, this model is used as initial
++                        raw model (0.raw in the script) instead of initializing
++                        the model from xconfig. Configs dir is not expected to
++                        exist and left/right context is computed from this
++                        model.""")
++    parser.add_argument("--trainer.prior-subset-size", type=int,
++                        dest='prior_subset_size', default=20000,
++                        help="Number of samples for computing priors")
++    parser.add_argument("--trainer.num-jobs-compute-prior", type=int,
++                        dest='num_jobs_compute_prior', default=10,
++                        help="The prior computation jobs are single "
++                        "threaded and run on the CPU")
++
++    # Parameters for the optimization
++    parser.add_argument("--trainer.optimization.minibatch-size",
++                        type=str, dest='minibatch_size', default='512',
++                        help="""Size of the minibatch used in SGD training
++                        (argument to nnet3-merge-egs); may be a more general
++                        rule as accepted by the --minibatch-size option of
++                        nnet3-merge-egs; run that program without args to see
++                        the format.""")
++
++    # General options
++    parser.add_argument("--feat-dir", type=str, required=False,
++                        help="Directory with features used for training "
++                        "the neural network.")
++    parser.add_argument("--lang", type=str, required=False,
++                        help="Language directory")
++    parser.add_argument("--ali-dir", type=str, required=True,
++                        help="Directory with alignments used for training "
++                        "the neural network.")
++    parser.add_argument("--dir", type=str, required=True,
++                        help="Directory to store the models and "
++                        "all other files.")
++
++    print(' '.join(sys.argv), file=sys.stderr)
++    print(sys.argv, file=sys.stderr)
++
++    args = parser.parse_args()
++
++    [args, run_opts] = process_args(args)
++
++    return [args, run_opts]
++
++
++def process_args(args):
++    """ Process the options got from get_args()
++    """
++
++    if args.frames_per_eg < 1:
++        raise Exception("--egs.frames-per-eg should have a minimum value of 1")
++
++    if not common_train_lib.validate_minibatch_size_str(args.minibatch_size):
++        raise Exception("--trainer.rnn.num-chunk-per-minibatch has an invalid value")
++
++    if (not os.path.exists(args.dir)):
++        raise Exception("This script expects --dir={0} to exist.")
++    if (not os.path.exists(args.dir+"/configs") and
++        (args.input_model is None or not os.path.exists(args.input_model))):
++        raise Exception("Either --trainer.input-model option should be supplied, "
++                        "and exist; or the {0}/configs directory should exist."
++                        "{0}/configs is the output of make_configs.py"
++                        "".format(args.dir))
++
++    # set the options corresponding to args.use_gpu
++    run_opts = common_train_lib.RunOpts()
++    if args.use_gpu in ["true", "false"]:
++        args.use_gpu = ("yes" if args.use_gpu == "true" else "no")
++    if args.use_gpu in ["yes", "wait"]:
++        if not common_lib.check_if_cuda_compiled():
++            logger.warning(
++                """You are running with one thread but you have not compiled
++                   for CUDA.  You may be running a setup optimized for GPUs.
++                   If you have GPUs and have nvcc installed, go to src/ and do
++                   ./configure; make""")
++
++        run_opts.train_queue_opt = "--gpu 1"
++        run_opts.parallel_train_opts = "--use-gpu={}".format(args.use_gpu)
++        run_opts.combine_gpu_opt = "--use-gpu={}".format(args.use_gpu)
++        run_opts.combine_queue_opt = "--gpu 1"
++        run_opts.prior_gpu_opt = "--use-gpu={}".format(args.use_gpu)
++        run_opts.prior_queue_opt = "--gpu 1"
++
++    else:
++        logger.warning("Without using a GPU this will be very slow. "
++                       "nnet3 does not yet support multiple threads.")
++
++        run_opts.train_queue_opt = ""
++        run_opts.parallel_train_opts = "--use-gpu=no"
++        run_opts.combine_gpu_opt = "--use-gpu=no"
++        run_opts.combine_queue_opt = ""
++        run_opts.prior_gpu_opt = "--use-gpu=no"
++        run_opts.prior_queue_opt = ""
++
++    run_opts.command = args.command
++    run_opts.egs_command = (args.egs_command
++                            if args.egs_command is not None else
++                            args.command)
++    run_opts.num_jobs_compute_prior = args.num_jobs_compute_prior
++
++    return [args, run_opts]
++
++
++def train(args, run_opts):
++    """ The main function for training.
++
++    Args:
++        args: a Namespace object with the required parameters
++            obtained from the function process_args()
++        run_opts: RunOpts object obtained from the process_args()
++    """
++
++    arg_string = pprint.pformat(vars(args))
++    logger.info("Arguments for the experiment\n{0}".format(arg_string))
++
++    # Copy phones.txt from ali-dir to dir. Later, steps/nnet3/decode.sh will
++    # use it to check compatibility between training and decoding phone-sets.
++    shutil.copy('{0}/phones.txt'.format(args.ali_dir), args.dir)
++
++    # Set some variables.
++    # num_leaves = common_lib.get_number_of_leaves_from_tree(args.ali_dir)
++    num_jobs = common_lib.get_number_of_jobs(args.ali_dir)
++    feat_dim = common_lib.get_feat_dim(args.feat_dir)
++    ivector_dim = common_lib.get_ivector_dim(args.online_ivector_dir)
++    ivector_id = common_lib.get_ivector_extractor_id(args.online_ivector_dir)
++
++    # split the training data into parts for individual jobs
++    # we will use the same number of jobs as that used for alignment
++    common_lib.execute_command("utils/split_data.sh {0} {1}".format(
++        args.feat_dir, num_jobs))
++    shutil.copy('{0}/tree'.format(args.ali_dir), args.dir)
++
++    with open('{0}/num_jobs'.format(args.dir), 'w') as f:
++        f.write(str(num_jobs))
++
++    if args.input_model is None:
++        config_dir = '{0}/configs'.format(args.dir)
++        var_file = '{0}/vars'.format(config_dir)
++
++        variables = common_train_lib.parse_generic_config_vars_file(var_file)
++    else:
++        # If args.input_model is specified, the model left and right contexts
++        # are computed using input_model.
++        variables = common_train_lib.get_input_model_info(args.input_model)
++
++    # Set some variables.
++    try:
++        model_left_context = variables['model_left_context']
++        model_right_context = variables['model_right_context']
++    except KeyError as e:
++        raise Exception("KeyError {0}: Variables need to be defined in "
++                        "{1}".format(str(e), '{0}/configs'.format(args.dir)))
++
++    left_context = model_left_context
++    right_context = model_right_context
++
++    # Initialize as "raw" nnet, prior to training the LDA-like preconditioning
++    # matrix.  This first config just does any initial splicing that we do;
++    # we do this as it's a convenient way to get the stats for the 'lda-like'
++    # transform.
++
++    if (args.stage <= -5) and os.path.exists(args.dir+"/configs/init.config") and \
++       (args.input_model is None):
++        logger.info("Initializing a basic network for estimating "
++                    "preconditioning matrix")
++        common_lib.execute_command(
++            """{command} {dir}/log/nnet_init.log \
++                    nnet3-init --srand=-2 {dir}/configs/init.config \
++                    {dir}/init.raw""".format(command=run_opts.command,
++                                             dir=args.dir))
++
++    default_egs_dir = '{0}/egs'.format(args.dir)
++    if (args.stage <= -4) and args.egs_dir is None:
++        logger.info("Generating egs")
++
++        if args.feat_dir is None:
++            raise Exception("--feat-dir option is required if you don't supply --egs-dir")
++
++        # train_lib.acoustic_model.generate_egs(
++        #     data=args.feat_dir, alidir=args.ali_dir, egs_dir=default_egs_dir,
++        #     left_context=left_context, right_context=right_context,
++        #     run_opts=run_opts,
++        #     frames_per_eg_str=str(args.frames_per_eg),
++        #     srand=args.srand,
++        #     egs_opts=args.egs_opts,
++        #     cmvn_opts=args.cmvn_opts,
++        #     online_ivector_dir=args.online_ivector_dir,
++        #     samples_per_iter=args.samples_per_iter,
++        #     stage=args.egs_stage)
++        
++        common_lib.execute_command(
++            """steps/nnet3/get_egs_dcae.sh {egs_opts} \
++                --cmd "{command}" \
++                --nj 3 \
++                --cmvn-opts "{cmvn_opts}" \
++                --online-ivector-dir "{ivector_dir}" \
++                --left-context {left_context} \
++                --right-context {right_context} \
++                --stage {stage} \
++                --samples-per-iter {frames_per_iter} \
++                --frames-per-eg {frames_per_eg_str} \
++                --num_utts_subset 5 \
++                --srand {srand} \
++                {data_dir} {ali_dir} {target_scp} {egs_dir}""".format(
++                egs_opts=args.egs_opts if args.egs_opts is not None else '',
++                command=run_opts.egs_command,
++                cmvn_opts=args.cmvn_opts if args.cmvn_opts is not None else '',
++                ivector_dir=(args.online_ivector_dir
++                                if args.online_ivector_dir is not None
++                                else ''),
++                left_context=left_context,
++                right_context=right_context,
++                stage=args.egs_stage, frames_per_iter=args.samples_per_iter,
++                frames_per_eg_str=str(args.frames_per_eg), srand=args.srand, 
++                data_dir=args.feat_dir, ali_dir=args.ali_dir, target_scp=args.feat_dir+"/feats.scp", egs_dir=default_egs_dir))
++
++    if args.egs_dir is None:
++        egs_dir = default_egs_dir
++    else:
++        egs_dir = args.egs_dir
++
++    [egs_left_context, egs_right_context,
++     frames_per_eg_str, num_archives] = (
++         common_train_lib.verify_egs_dir(egs_dir, feat_dim,
++                                         ivector_dim, ivector_id,
++                                         left_context, right_context))
++    assert str(args.frames_per_eg) == frames_per_eg_str
++
++    if args.num_jobs_final > num_archives:
++        logger.info('num_jobs_final cannot exceed the number of archives in the egs directory')
++        args.num_jobs_final = num_archives
++        # raise Exception('num_jobs_final cannot exceed the number of archives '
++        #                 'in the egs directory')
++
++    # copy the properties of the egs to dir for
++    # use during decoding
++    common_train_lib.copy_egs_properties_to_exp_dir(egs_dir, args.dir)
++
++    if args.stage <= -3 and os.path.exists(args.dir+"/configs/init.config") and (args.input_model is None):
++        logger.info('Computing the preconditioning matrix for input features')
++
++        train_lib.common.compute_preconditioning_matrix(
++            args.dir, egs_dir, num_archives, run_opts,
++            max_lda_jobs=args.max_lda_jobs,
++            rand_prune=args.rand_prune)
++
++    if args.stage <= -2 and (args.input_model is None):
++        logger.info("Computing initial vector for FixedScaleComponent before"
++                    " softmax, using priors^{prior_scale} and rescaling to"
++                    " average 1".format(
++                        prior_scale=args.presoftmax_prior_scale_power))
++
++        common_train_lib.compute_presoftmax_prior_scale(
++            args.dir, args.ali_dir, num_jobs, run_opts,
++            presoftmax_prior_scale_power=args.presoftmax_prior_scale_power)
++
++    if args.stage <= -1:
++        logger.info("Preparing the initial acoustic model.")
++        train_lib.acoustic_model.prepare_initial_acoustic_model(
++            args.dir, args.ali_dir, run_opts,
++            input_model=args.input_model)
++
++    # set num_iters so that as close as possible, we process the data
++    # $num_epochs times, i.e. $num_iters*$avg_num_jobs) ==
++    # $num_epochs*$num_archives, where
++    # avg_num_jobs=(num_jobs_initial+num_jobs_final)/2.
++    num_archives_expanded = num_archives * args.frames_per_eg
++    num_archives_to_process = int(args.num_epochs * num_archives_expanded)
++    num_archives_processed = 0
++    num_iters = ((num_archives_to_process * 2)
++                 / (args.num_jobs_initial + args.num_jobs_final))
++
++    # If do_final_combination is True, compute the set of models_to_combine.
++    # Otherwise, models_to_combine will be none.
++    if args.do_final_combination:
++        models_to_combine = common_train_lib.get_model_combine_iters(
++            num_iters, args.num_epochs,
++            num_archives_expanded, args.max_models_combine,
++            args.num_jobs_final)
++    else:
++        models_to_combine = None
++
++    logger.info("Training will run for {0} epochs = "
++                "{1} iterations".format(args.num_epochs, num_iters))
++
++    for iter in range(num_iters):
++        if (args.exit_stage is not None) and (iter == args.exit_stage):
++            logger.info("Exiting early due to --exit-stage {0}".format(iter))
++            return
++        current_num_jobs = int(0.5 + args.num_jobs_initial
++                               + (args.num_jobs_final - args.num_jobs_initial)
++                               * float(iter) / num_iters)
++
++        if args.stage <= iter:
++            lrate = common_train_lib.get_learning_rate(iter, current_num_jobs,
++                                                       num_iters,
++                                                       num_archives_processed,
++                                                       num_archives_to_process,
++                                                       args.initial_effective_lrate,
++                                                       args.final_effective_lrate)
++            shrinkage_value = 1.0 - (args.proportional_shrink * lrate)
++            if shrinkage_value <= 0.5:
++                raise Exception("proportional-shrink={0} is too large, it gives "
++                                "shrink-value={1}".format(args.proportional_shrink,
++                                                          shrinkage_value))
++
++            percent = num_archives_processed * 100.0 / num_archives_to_process
++            epoch = (num_archives_processed * args.num_epochs
++                     / num_archives_to_process)
++            shrink_info_str = ''
++            if shrinkage_value != 1.0:
++                shrink_info_str = 'shrink: {0:0.5f}'.format(shrinkage_value)
++            logger.info("Iter: {0}/{1}    "
++                        "Epoch: {2:0.2f}/{3:0.1f} ({4:0.1f}% complete)    "
++                        "lr: {5:0.6f}    {6}".format(iter, num_iters - 1,
++                                                     epoch, args.num_epochs,
++                                                     percent,
++                                                     lrate, shrink_info_str))
++
++            train_lib.common.train_one_iteration(
++                dir=args.dir,
++                iter=iter,
++                srand=args.srand,
++                egs_dir=egs_dir,
++                num_jobs=current_num_jobs,
++                num_archives_processed=num_archives_processed,
++                num_archives=num_archives,
++                learning_rate=lrate,
++                dropout_edit_string=common_train_lib.get_dropout_edit_string(
++                    args.dropout_schedule,
++                    float(num_archives_processed) / num_archives_to_process,
++                    iter),
++                train_opts=' '.join(args.train_opts),
++                minibatch_size_str=args.minibatch_size,
++                frames_per_eg=args.frames_per_eg,
++                momentum=args.momentum,
++                max_param_change=args.max_param_change,
++                shrinkage_value=shrinkage_value,
++                shuffle_buffer_size=args.shuffle_buffer_size,
++                run_opts=run_opts)
++
++            if args.cleanup:
++                # do a clean up everythin but the last 2 models, under certain
++                # conditions
++                common_train_lib.remove_model(
++                    args.dir, iter-2, num_iters, models_to_combine,
++                    args.preserve_model_interval)
++
++            if args.email is not None:
++                reporting_iter_interval = num_iters * args.reporting_interval
++                if iter % reporting_iter_interval == 0:
++                    # lets do some reporting
++                    [report, times, data] = (
++                        nnet3_log_parse.generate_acc_logprob_report(args.dir))
++                    message = report
++                    subject = ("Update : Expt {dir} : "
++                               "Iter {iter}".format(dir=args.dir, iter=iter))
++                    common_lib.send_mail(message, subject, args.email)
++
++        num_archives_processed = num_archives_processed + current_num_jobs
++
++    if args.stage <= num_iters:
++        if args.do_final_combination:
++            logger.info("Doing final combination to produce final.mdl")
++            train_lib.common.combine_models(
++                dir=args.dir, num_iters=num_iters,
++                models_to_combine=models_to_combine,
++                egs_dir=egs_dir,
++                minibatch_size_str=args.minibatch_size, run_opts=run_opts,
++                max_objective_evaluations=args.max_objective_evaluations)
++
++    if args.stage <= num_iters + 1:
++        logger.info("Getting average posterior for purposes of "
++                    "adjusting the priors.")
++
++        # If args.do_final_combination is true, we will use the combined model.
++        # Otherwise, we will use the last_numbered model.
++        real_iter = 'combined' if args.do_final_combination else num_iters
++        avg_post_vec_file = train_lib.common.compute_average_posterior(
++            dir=args.dir, iter=real_iter,
++            egs_dir=egs_dir, num_archives=num_archives,
++            prior_subset_size=args.prior_subset_size, run_opts=run_opts)
++
++        logger.info("Re-adjusting priors based on computed posteriors")
++        combined_or_last_numbered_model = "{dir}/{iter}.mdl".format(dir=args.dir,
++                iter=real_iter)
++        final_model = "{dir}/final.mdl".format(dir=args.dir)
++        train_lib.common.adjust_am_priors(args.dir, combined_or_last_numbered_model,
++                avg_post_vec_file, final_model, run_opts)
++
++
++    if args.cleanup:
++        logger.info("Cleaning up the experiment directory "
++                    "{0}".format(args.dir))
++        remove_egs = args.remove_egs
++        if args.egs_dir is not None:
++            # this egs_dir was not created by this experiment so we will not
++            # delete it
++            remove_egs = False
++
++        common_train_lib.clean_nnet_dir(
++            nnet_dir=args.dir, num_iters=num_iters, egs_dir=egs_dir,
++            preserve_model_interval=args.preserve_model_interval,
++            remove_egs=remove_egs)
++
++    # do some reporting
++    [report, times, data] = nnet3_log_parse.generate_acc_logprob_report(args.dir)
++    if args.email is not None:
++        common_lib.send_mail(report, "Update : Expt {0} : "
++                                     "complete".format(args.dir), args.email)
++
++    with open("{dir}/accuracy.report".format(dir=args.dir), "w") as f:
++        f.write(report)
++
++    common_lib.execute_command("steps/info/nnet3_dir_info.pl "
++                               "{0}".format(args.dir))
++
++
++def main():
++    [args, run_opts] = get_args()
++    try:
++        train(args, run_opts)
++        common_lib.wait_for_background_commands()
++    except BaseException as e:
++        # look for BaseException so we catch KeyboardInterrupt, which is
++        # what we get when a background thread dies.
++        if args.email is not None:
++            message = ("Training session for experiment {dir} "
++                       "died due to an error.".format(dir=args.dir))
++            common_lib.send_mail(message, message, args.email)
++        if not isinstance(e, KeyboardInterrupt):
++            traceback.print_exc()
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/egs/wsj/s5/steps/nnet3/train_dcae_rnn.py b/egs/wsj/s5/steps/nnet3/train_dcae_rnn.py
+new file mode 100755
+index 0000000..fea5a32
+--- /dev/null
++++ b/egs/wsj/s5/steps/nnet3/train_dcae_rnn.py
+@@ -0,0 +1,594 @@
++#!/usr/bin/env python
++
++# Copyright 2016    Vijayaditya Peddinti.
++#           2016    Vimal Manohar
++# Apache 2.0.
++
++""" This script is based on steps/nnet3/lstm/train.sh
++"""
++
++from __future__ import print_function
++import argparse
++import logging
++import os
++import pprint
++import shutil
++import sys
++import traceback
++
++sys.path.insert(0, 'steps')
++import libs.nnet3.train.common as common_train_lib
++import libs.common as common_lib
++import libs.nnet3.train.frame_level_objf as train_lib
++import libs.nnet3.report.log_parse as nnet3_log_parse
++
++
++logger = logging.getLogger('libs')
++logger.setLevel(logging.INFO)
++handler = logging.StreamHandler()
++handler.setLevel(logging.INFO)
++formatter = logging.Formatter("%(asctime)s [%(pathname)s:%(lineno)s - "
++                              "%(funcName)s - %(levelname)s ] %(message)s")
++handler.setFormatter(formatter)
++logger.addHandler(handler)
++logger.info('Starting RNN trainer (train_rnn.py)')
++
++
++def get_args():
++    """ Get args from stdin.
++
++    We add compulsary arguments as named arguments for readability
++
++    The common options are defined in the object
++    libs.nnet3.train.common.CommonParser.parser.
++    See steps/libs/nnet3/train/common.py
++    """
++
++    parser = argparse.ArgumentParser(
++        description="""Trains an RNN acoustic model using the cross-entropy
++        objective.  RNNs include LSTMs, BLSTMs and GRUs.
++        RNN acoustic model training differs from feed-forward DNN training in
++        the following ways
++            1. RNN acoustic models train on output chunks rather than
++               individual outputs
++            2. The training includes additional stage of shrinkage, where
++               the parameters of the model are scaled when the derivative
++               averages at the non-linearities are below a threshold.
++            3. RNNs can also be trained with state preservation training""",
++        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++        conflict_handler='resolve',
++        parents=[common_train_lib.CommonParser(default_chunk_left_context=40).parser])
++
++    # egs extraction options
++    parser.add_argument("--egs.chunk-width", type=str, dest='chunk_width',
++                        default="20",
++                        help="""Number of frames per chunk in the examples
++                        used to train the RNN.   Caution: if you double this you
++                        should halve --trainer.samples-per-iter.  May be
++                        a comma-separated list of alternatives: first width
++                        is the 'principal' chunk-width, used preferentially""")
++    parser.add_argument("--trainer.input-model", type=str,
++                        dest='input_model', default=None,
++                        action=common_lib.NullstrToNoneAction,
++                        help="""If specified, this model is used as initial
++                        raw model (0.raw in the script) instead of initializing
++                        the model from xconfig. Configs dir is not expected to
++                        exist and left/right context is computed from this
++                        model.""")
++    parser.add_argument("--trainer.samples-per-iter", type=int,
++                        dest='samples_per_iter', default=20000,
++                        help="""This is really the number of egs in each
++                        archive.  Each eg has 'chunk_width' frames in it--
++                        for chunk_width=20, this value (20k) is equivalent
++                        to the 400k number that we use as a default in
++                        regular DNN training.
++                        Overrides the default value in CommonParser.""")
++    parser.add_argument("--trainer.prior-subset-size", type=int,
++                        dest='prior_subset_size', default=20000,
++                        help="Number of samples for computing priors")
++    parser.add_argument("--trainer.num-jobs-compute-prior", type=int,
++                        dest='num_jobs_compute_prior', default=10,
++                        help="The prior computation jobs are single "
++                        "threaded and run on the CPU")
++
++    # Parameters for the optimization
++    parser.add_argument("--trainer.optimization.momentum", type=float,
++                        dest='momentum', default=0.5,
++                        help="""Momentum used in update computation.
++                        Note: we implemented it in such a way that
++                        it doesn't increase the effective learning rate.
++                        Overrides the default value in CommonParser""")
++    parser.add_argument("--trainer.optimization.shrink-value", type=float,
++                        dest='shrink_value', default=0.99,
++                        help="""Scaling factor used for scaling the parameter
++                        matrices when the derivative averages are below the
++                        shrink-threshold at the non-linearities.  E.g. 0.99.
++                        Only applicable when the neural net contains sigmoid or
++                        tanh units.""")
++    parser.add_argument("--trainer.optimization.shrink-saturation-threshold",
++                        type=float,
++                        dest='shrink_saturation_threshold', default=0.40,
++                        help="""Threshold that controls when we apply the
++                        'shrinkage' (i.e. scaling by shrink-value).  If the
++                        saturation of the sigmoid and tanh nonlinearities in
++                        the neural net (as measured by
++                        steps/nnet3/get_saturation.pl) exceeds this threshold
++                        we scale the parameter matrices with the
++                        shrink-value.""")
++    # RNN specific trainer options
++    parser.add_argument("--trainer.rnn.num-chunk-per-minibatch", type=str,
++                        dest='num_chunk_per_minibatch', default='100',
++                        help="""Number of sequences to be processed in
++                        parallel every minibatch.  May be a more general
++                        rule as accepted by the --minibatch-size option of
++                        nnet3-merge-egs; run that program without args to see
++                        the format.""")
++    parser.add_argument("--trainer.deriv-truncate-margin", type=int,
++                        dest='deriv_truncate_margin', default=8,
++                        help="""Margin (in input frames) around the 'required'
++                        part of each chunk that the derivatives are
++                        backpropagated to. E.g., 8 is a reasonable setting.
++                        Note: the 'required' part of the chunk is defined by
++                        the model's {left,right}-context.""")
++
++    # General options
++    parser.add_argument("--feat-dir", type=str, required=False,
++                        help="Directory with features used for training "
++                        "the neural network.")
++    parser.add_argument("--lang", type=str, required=False,
++                        help="Language directory")
++    parser.add_argument("--ali-dir", type=str, required=True,
++                        help="Directory with alignments used for training "
++                        "the neural network.")
++    parser.add_argument("--dir", type=str, required=True,
++                        help="Directory to store the models and "
++                        "all other files.")
++
++    print(' '.join(sys.argv))
++    print(sys.argv)
++
++    args = parser.parse_args()
++
++    [args, run_opts] = process_args(args)
++
++    return [args, run_opts]
++
++
++def process_args(args):
++    """ Process the options got from get_args()
++    """
++
++    if not common_train_lib.validate_chunk_width(args.chunk_width):
++        raise Exception("--egs.chunk-width has an invalid value")
++
++    if not common_train_lib.validate_minibatch_size_str(args.num_chunk_per_minibatch):
++        raise Exception("--trainer.rnn.num-chunk-per-minibatch has an invalid value")
++
++    if args.chunk_left_context < 0:
++        raise Exception("--egs.chunk-left-context should be non-negative")
++
++    if args.chunk_right_context < 0:
++        raise Exception("--egs.chunk-right-context should be non-negative")
++
++    if (not os.path.exists(args.dir)):
++        raise Exception("This script expects --dir={0} to exist.")
++
++    if (not os.path.exists(args.dir+"/configs") and
++        (args.input_model is None or not os.path.exists(args.input_model))):
++        raise Exception("Either --trainer.input-model option should be supplied, "
++                        "and exist; or the {0}/configs directory should exist."
++                        "{0}/configs is the output of make_configs.py"
++                        "".format(args.dir))
++
++    # set the options corresponding to args.use_gpu
++    run_opts = common_train_lib.RunOpts()
++    if args.use_gpu in ["true", "false"]:
++        args.use_gpu = ("yes" if args.use_gpu == "true" else "no")
++    if args.use_gpu in ["yes", "wait"]:
++        if not common_lib.check_if_cuda_compiled():
++            logger.warning(
++                """You are running with one thread but you have not compiled
++                   for CUDA.  You may be running a setup optimized for GPUs.
++                   If you have GPUs and have nvcc installed, go to src/ and do
++                   ./configure; make""")
++
++        run_opts.train_queue_opt = "--gpu 1"
++        run_opts.parallel_train_opts = "--use-gpu={}".format(args.use_gpu)
++        run_opts.combine_gpu_opt = "--use-gpu={}".format(args.use_gpu)
++        run_opts.combine_queue_opt = "--gpu 1"
++        run_opts.prior_gpu_opt = "--use-gpu={}".format(args.use_gpu)
++        run_opts.prior_queue_opt = "--gpu 1"
++
++    else:
++        logger.warning("Without using a GPU this will be very slow. "
++                       "nnet3 does not yet support multiple threads.")
++
++        run_opts.train_queue_opt = ""
++        run_opts.parallel_train_opts = "--use-gpu=no"
++        run_opts.combine_gpu_opt = "--use-gpu=no"
++        run_opts.combine_queue_opt = ""
++        run_opts.prior_gpu_opt = "--use-gpu=no"
++        run_opts.prior_queue_opt = ""
++
++    run_opts.command = args.command
++    run_opts.egs_command = (args.egs_command
++                            if args.egs_command is not None else
++                            args.command)
++    run_opts.num_jobs_compute_prior = args.num_jobs_compute_prior
++
++    return [args, run_opts]
++
++
++def train(args, run_opts):
++    """ The main function for training.
++
++    Args:
++        args: a Namespace object with the required parameters
++            obtained from the function process_args()
++        run_opts: RunOpts object obtained from the process_args()
++    """
++
++    arg_string = pprint.pformat(vars(args))
++    logger.info("Arguments for the experiment\n{0}".format(arg_string))
++
++    # Copy phones.txt from ali-dir to dir. Later, steps/nnet3/decode.sh will
++    # use it to check compatibility between training and decoding phone-sets.
++    shutil.copy('{0}/phones.txt'.format(args.ali_dir), args.dir)
++
++    # Set some variables.
++    num_jobs = common_lib.get_number_of_jobs(args.ali_dir)
++    feat_dim = common_lib.get_feat_dim(args.feat_dir)
++    ivector_dim = common_lib.get_ivector_dim(args.online_ivector_dir)
++    ivector_id = common_lib.get_ivector_extractor_id(args.online_ivector_dir)
++
++    # split the training data into parts for individual jobs
++    # we will use the same number of jobs as that used for alignment
++    common_lib.execute_command("utils/split_data.sh {0} {1}".format(
++        args.feat_dir, num_jobs))
++    shutil.copy('{0}/tree'.format(args.ali_dir), args.dir)
++
++    with open('{0}/num_jobs'.format(args.dir), 'w') as f:
++        f.write(str(num_jobs))
++
++    config_dir = '{0}/configs'.format(args.dir)
++    var_file = '{0}/vars'.format(config_dir)
++
++    if args.input_model is None:
++        config_dir = '{0}/configs'.format(args.dir)
++        var_file = '{0}/vars'.format(config_dir)
++
++        variables = common_train_lib.parse_generic_config_vars_file(var_file)
++    else:
++        # If args.input_model is specified, the model left and right contexts
++        # are computed using input_model.
++        variables = common_train_lib.get_input_model_info(args.input_model)
++
++    # Set some variables.
++    try:
++        model_left_context = variables['model_left_context']
++        model_right_context = variables['model_right_context']
++    except KeyError as e:
++        raise Exception("KeyError {0}: Variables need to be defined in "
++                        "{1}".format(str(e), '{0}/configs'.format(args.dir)))
++
++    left_context = args.chunk_left_context + model_left_context
++    right_context = args.chunk_right_context + model_right_context
++    left_context_initial = (args.chunk_left_context_initial + model_left_context if
++                            args.chunk_left_context_initial >= 0 else -1)
++    right_context_final = (args.chunk_right_context_final + model_right_context if
++                           args.chunk_right_context_final >= 0 else -1)
++
++    # Initialize as "raw" nnet, prior to training the LDA-like preconditioning
++    # matrix.  This first config just does any initial splicing that we do;
++    # we do this as it's a convenient way to get the stats for the 'lda-like'
++    # transform.
++
++    if (args.stage <= -5) and (args.input_model is None):
++        logger.info("Initializing a basic network for estimating "
++                    "preconditioning matrix")
++        common_lib.execute_command(
++            """{command} {dir}/log/nnet_init.log \
++                    nnet3-init --srand=-2 {dir}/configs/init.config \
++                    {dir}/init.raw""".format(command=run_opts.command,
++                                             dir=args.dir))
++
++    default_egs_dir = '{0}/egs'.format(args.dir)
++    if args.stage <= -4 and args.egs_dir is None:
++        logger.info("Generating egs")
++
++        if args.feat_dir is None:
++            raise Exception("--feat-dir option is required if you don't supply --egs-dir")
++
++        # train_lib.acoustic_model.generate_egs(
++        #     data=args.feat_dir, alidir=args.ali_dir,
++        #     egs_dir=default_egs_dir,
++        #     left_context=left_context,
++        #     right_context=right_context,
++        #     left_context_initial=left_context_initial,
++        #     right_context_final=right_context_final,
++        #     run_opts=run_opts,
++        #     frames_per_eg_str=args.chunk_width,
++        #     srand=args.srand,
++        #     egs_opts=args.egs_opts,
++        #     cmvn_opts=args.cmvn_opts,
++        #     online_ivector_dir=args.online_ivector_dir,
++        #     samples_per_iter=args.samples_per_iter,
++        #     stage=args.egs_stage)
++
++        common_lib.execute_command(
++            """steps/nnet3/get_egs_dcae.sh {egs_opts} \
++            --cmd "{command}" \
++            --nj 3 \
++            --cmvn-opts "{cmvn_opts}" \
++            --online-ivector-dir "{ivector_dir}" \
++            --left-context {left_context} \
++            --right-context {right_context} \
++            --left-context-initial {left_context_initial} \
++            --right-context-final {right_context_final} \
++            --stage {stage} \
++            --samples-per-iter {frames_per_iter} \
++            --frames-per-eg {frames_per_eg_str} \
++            --num_utts_subset 5 \
++            --srand {srand} \
++            {data_dir} {ali_dir} {target_scp} {egs_dir}""".format(
++                egs_opts=args.egs_opts if args.egs_opts is not None else '',
++                command=run_opts.egs_command,
++                cmvn_opts=args.cmvn_opts if args.cmvn_opts is not None else '',
++                ivector_dir=(args.online_ivector_dir
++                                if args.online_ivector_dir is not None
++                                else ''),
++                left_context=left_context,
++                right_context=right_context,
++                left_context_initial=left_context_initial,
++                right_context_final=right_context_final,
++                stage=args.egs_stage, frames_per_iter=args.samples_per_iter,
++                frames_per_eg_str=args.chunk_width, srand=args.srand,
++                data_dir=args.feat_dir, ali_dir=args.ali_dir, target_scp=args.feat_dir+"/feats.scp", egs_dir=default_egs_dir))
++
++    if args.egs_dir is None:
++        egs_dir = default_egs_dir
++    else:
++        egs_dir = args.egs_dir
++
++    [egs_left_context, egs_right_context,
++     frames_per_eg_str, num_archives] = (
++         common_train_lib.verify_egs_dir(egs_dir, feat_dim,
++                                         ivector_dim, ivector_id,
++                                         left_context, right_context,
++                                         left_context_initial, right_context_final))
++    if args.chunk_width != frames_per_eg_str:
++        raise Exception("mismatch between --egs.chunk-width and the frames_per_eg "
++                        "in the egs dir {0} vs {1}".format(args.chunk_width,
++                                                           frames_per_eg_str))
++
++    if args.num_jobs_final > num_archives:
++        args.num_jobs_final = num_archives
++        logger.info('num_jobs_final cannot exceed the number of archives '
++                    'in the egs directory')
++        # raise Exception('num_jobs_final cannot exceed the number of archives '
++        #                 'in the egs directory')
++
++    # copy the properties of the egs to dir for
++    # use during decoding
++    common_train_lib.copy_egs_properties_to_exp_dir(egs_dir, args.dir)
++
++    if args.stage <= -3 and (args.input_model is None):
++        logger.info('Computing the preconditioning matrix for input features')
++
++        train_lib.common.compute_preconditioning_matrix(
++            args.dir, egs_dir, num_archives, run_opts,
++            max_lda_jobs=args.max_lda_jobs,
++            rand_prune=args.rand_prune)
++
++    if args.stage <= -2 and (args.input_model is None):
++        logger.info("Computing initial vector for FixedScaleComponent before"
++                    " softmax, using priors^{prior_scale} and rescaling to"
++                    " average 1".format(
++                        prior_scale=args.presoftmax_prior_scale_power))
++
++        common_train_lib.compute_presoftmax_prior_scale(
++            args.dir, args.ali_dir, num_jobs, run_opts,
++            presoftmax_prior_scale_power=args.presoftmax_prior_scale_power)
++
++    if args.stage <= -1:
++        logger.info("Preparing the initial acoustic model.")
++        train_lib.acoustic_model.prepare_initial_acoustic_model(
++            args.dir, args.ali_dir, run_opts,
++            input_model=args.input_model)
++
++    # set num_iters so that as close as possible, we process the data
++    # $num_epochs times, i.e. $num_iters*$avg_num_jobs) ==
++    # $num_epochs*$num_archives, where
++    # avg_num_jobs=(num_jobs_initial+num_jobs_final)/2.
++    num_archives_to_process = int(args.num_epochs * num_archives)
++    num_archives_processed = 0
++    num_iters = ((num_archives_to_process * 2)
++                 / (args.num_jobs_initial + args.num_jobs_final))
++
++    # If do_final_combination is True, compute the set of models_to_combine.
++    # Otherwise, models_to_combine will be none.
++    if args.do_final_combination:
++        models_to_combine = common_train_lib.get_model_combine_iters(
++            num_iters, args.num_epochs,
++            num_archives, args.max_models_combine,
++            args.num_jobs_final)
++    else:
++        models_to_combine = None
++
++    min_deriv_time = None
++    max_deriv_time_relative = None
++    if args.deriv_truncate_margin is not None:
++        min_deriv_time = -args.deriv_truncate_margin - model_left_context
++        max_deriv_time_relative = \
++           args.deriv_truncate_margin + model_right_context
++
++    logger.info("Training will run for {0} epochs = "
++                "{1} iterations".format(args.num_epochs, num_iters))
++
++    for iter in range(num_iters):
++        if (args.exit_stage is not None) and (iter == args.exit_stage):
++            logger.info("Exiting early due to --exit-stage {0}".format(iter))
++            return
++        current_num_jobs = int(0.5 + args.num_jobs_initial
++                               + (args.num_jobs_final - args.num_jobs_initial)
++                               * float(iter) / num_iters)
++
++        if args.stage <= iter:
++            model_file = "{dir}/{iter}.mdl".format(dir=args.dir, iter=iter)
++
++
++            lrate = common_train_lib.get_learning_rate(iter, current_num_jobs,
++                                                       num_iters,
++                                                       num_archives_processed,
++                                                       num_archives_to_process,
++                                                       args.initial_effective_lrate,
++                                                       args.final_effective_lrate)
++
++            shrinkage_value = 1.0 - (args.proportional_shrink * lrate)
++            if shrinkage_value <= 0.5:
++                raise Exception("proportional-shrink={0} is too large, it gives "
++                                "shrink-value={1}".format(args.proportional_shrink,
++                                                          shrinkage_value))
++            if args.shrink_value < shrinkage_value:
++                shrinkage_value = (args.shrink_value
++                                   if common_train_lib.should_do_shrinkage(
++                                           iter, model_file,
++                                           args.shrink_saturation_threshold) else 1.0)
++
++            percent = num_archives_processed * 100.0 / num_archives_to_process
++            epoch = (num_archives_processed * args.num_epochs
++                     / num_archives_to_process)
++            shrink_info_str = ''
++            if shrinkage_value != 1.0:
++                shrink_info_str = 'shrink: {0:0.5f}'.format(shrinkage_value)
++            logger.info("Iter: {0}/{1}    "
++                        "Epoch: {2:0.2f}/{3:0.1f} ({4:0.1f}% complete)    "
++                        "lr: {5:0.6f}    {6}".format(iter, num_iters - 1,
++                                                     epoch, args.num_epochs,
++                                                     percent,
++                                                     lrate, shrink_info_str))
++
++            train_lib.common.train_one_iteration(
++                dir=args.dir,
++                iter=iter,
++                srand=args.srand,
++                egs_dir=egs_dir,
++                num_jobs=current_num_jobs,
++                num_archives_processed=num_archives_processed,
++                num_archives=num_archives,
++                learning_rate=lrate,
++                dropout_edit_string=common_train_lib.get_dropout_edit_string(
++                    args.dropout_schedule,
++                    float(num_archives_processed) / num_archives_to_process,
++                    iter),
++                train_opts=' '.join(args.train_opts),
++                shrinkage_value=shrinkage_value,
++                minibatch_size_str=args.num_chunk_per_minibatch,
++                min_deriv_time=min_deriv_time,
++                max_deriv_time_relative=max_deriv_time_relative,
++                momentum=args.momentum,
++                max_param_change=args.max_param_change,
++                shuffle_buffer_size=args.shuffle_buffer_size,
++                run_opts=run_opts,
++                backstitch_training_scale=args.backstitch_training_scale,
++                backstitch_training_interval=args.backstitch_training_interval,
++                compute_per_dim_accuracy=args.compute_per_dim_accuracy)
++
++            if args.cleanup:
++                # do a clean up everythin but the last 2 models, under certain
++                # conditions
++                common_train_lib.remove_model(
++                    args.dir, iter-2, num_iters, models_to_combine,
++                    args.preserve_model_interval)
++
++            if args.email is not None:
++                reporting_iter_interval = num_iters * args.reporting_interval
++                if iter % reporting_iter_interval == 0:
++                    # lets do some reporting
++                    [report, times, data] = (
++                        nnet3_log_parse.generate_acc_logprob_report(args.dir))
++                    message = report
++                    subject = ("Update : Expt {dir} : "
++                               "Iter {iter}".format(dir=args.dir, iter=iter))
++                    common_lib.send_mail(message, subject, args.email)
++
++        num_archives_processed = num_archives_processed + current_num_jobs
++
++    if args.stage <= num_iters:
++        if args.do_final_combination:
++            logger.info("Doing final combination to produce final.mdl")
++            train_lib.common.combine_models(
++                dir=args.dir, num_iters=num_iters,
++                models_to_combine=models_to_combine, egs_dir=egs_dir,
++                run_opts=run_opts,
++                minibatch_size_str=args.num_chunk_per_minibatch,
++                chunk_width=args.chunk_width,
++                max_objective_evaluations=args.max_objective_evaluations,
++                compute_per_dim_accuracy=args.compute_per_dim_accuracy)
++
++    if args.stage <= num_iters + 1:
++        logger.info("Getting average posterior for purposes of "
++                    "adjusting the priors.")
++
++        # If args.do_final_combination is true, we will use the combined model.
++        # Otherwise, we will use the last_numbered model.
++        real_iter = 'combined' if args.do_final_combination else num_iters
++        avg_post_vec_file = train_lib.common.compute_average_posterior(
++            dir=args.dir, iter=real_iter, egs_dir=egs_dir,
++            num_archives=num_archives,
++            prior_subset_size=args.prior_subset_size, run_opts=run_opts)
++
++        logger.info("Re-adjusting priors based on computed posteriors")
++        combined_or_last_numbered_model = "{dir}/{iter}.mdl".format(dir=args.dir,
++                iter=real_iter)
++        final_model = "{dir}/final.mdl".format(dir=args.dir)
++        train_lib.common.adjust_am_priors(args.dir, combined_or_last_numbered_model,
++                                          avg_post_vec_file, final_model,
++                                          run_opts)
++
++    if args.cleanup:
++        logger.info("Cleaning up the experiment directory "
++                    "{0}".format(args.dir))
++        remove_egs = args.remove_egs
++        if args.egs_dir is not None:
++            # this egs_dir was not created by this experiment so we will not
++            # delete it
++            remove_egs = False
++
++        common_train_lib.clean_nnet_dir(
++            nnet_dir=args.dir, num_iters=num_iters, egs_dir=egs_dir,
++            preserve_model_interval=args.preserve_model_interval,
++            remove_egs=remove_egs)
++
++    # do some reporting
++    [report, times, data] = nnet3_log_parse.generate_acc_logprob_report(args.dir)
++    if args.email is not None:
++        common_lib.send_mail(report, "Update : Expt {0} : "
++                                     "complete".format(args.dir), args.email)
++
++    with open("{dir}/accuracy.report".format(dir=args.dir), "w") as f:
++        f.write(report)
++
++    common_lib.execute_command("steps/info/nnet3_dir_info.pl "
++                               "{0}".format(args.dir))
++
++
++def main():
++    [args, run_opts] = get_args()
++    try:
++        train(args, run_opts)
++        common_lib.wait_for_background_commands()
++    except BaseException as e:
++        # look for BaseException so we catch KeyboardInterrupt, which is
++        # what we get when a background thread dies.
++        if args.email is not None:
++            message = ("Training session for experiment {dir} "
++                       "died due to an error.".format(dir=args.dir))
++            common_lib.send_mail(message, message, args.email)
++        if not isinstance(e, KeyboardInterrupt):
++            traceback.print_exc()
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/nnet3bin/Makefile b/src/nnet3bin/Makefile
+index 67d15d3..ec85d91 100644
+--- a/src/nnet3bin/Makefile
++++ b/src/nnet3bin/Makefile
+@@ -6,7 +6,7 @@ include ../kaldi.mk
+ LDFLAGS += $(CUDA_LDFLAGS)
+ LDLIBS += $(CUDA_LDLIBS)
+ 
+-BINFILES = nnet3-init nnet3-info nnet3-get-egs nnet3-copy-egs nnet3-subset-egs \
++BINFILES = nnet3-init nnet3-info nnet3-get-egs nnet3-get-egs-dcae nnet3-copy-egs nnet3-subset-egs \
+    nnet3-shuffle-egs nnet3-acc-lda-stats nnet3-merge-egs \
+    nnet3-compute-from-egs nnet3-train nnet3-am-init nnet3-am-train-transitions \
+    nnet3-am-adjust-priors nnet3-am-copy nnet3-compute-prob \
+diff --git a/src/nnet3bin/nnet3-get-egs-dcae.cc b/src/nnet3bin/nnet3-get-egs-dcae.cc
+new file mode 100644
+index 0000000..f09e570
+--- /dev/null
++++ b/src/nnet3bin/nnet3-get-egs-dcae.cc
+@@ -0,0 +1,324 @@
++// nnet3bin/nnet3-get-egs.cc
++
++// Copyright 2012-2015  Johns Hopkins University (author:  Daniel Povey)
++//                2014  Vimal Manohar
++
++// See ../../COPYING for clarification regarding multiple authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//  http://www.apache.org/licenses/LICENSE-2.0
++//
++// THIS CODE IS PROVIDED *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
++// WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
++// MERCHANTABLITY OR NON-INFRINGEMENT.
++// See the Apache 2 License for the specific language governing permissions and
++// limitations under the License.
++
++#include <sstream>
++#include "base/kaldi-common.h"
++#include "hmm/posterior.h"
++#include "hmm/transition-model.h"
++#include "nnet3/nnet-example-utils.h"
++#include "nnet3/nnet-example.h"
++#include "util/common-utils.h"
++
++namespace kaldi {
++namespace nnet3 {
++
++static bool ProcessFile(const GeneralMatrix &feats,
++                        const MatrixBase<BaseFloat> *ivector_feats,
++                        int32 ivector_period, const Posterior &pdf_post,
++                        const std::string &utt_id, bool compress,
++                        int32 num_pdfs, const MatrixBase<BaseFloat> &targets,
++                        int32 num_targets, int32 length_tolerance,
++                        UtteranceSplitter *utt_splitter,
++                        NnetExampleWriter *example_writer) {
++  int32 num_input_frames = feats.NumRows();
++  if (!utt_splitter->LengthsMatch(utt_id, num_input_frames,
++                                  static_cast<int32>(pdf_post.size()),
++                                  length_tolerance))
++    return false;  // LengthsMatch() will have printed a warning.
++
++  if (!utt_splitter->LengthsMatch(utt_id, num_input_frames, targets.NumRows(),
++                                  length_tolerance)) {
++    return false;
++  }
++  if (targets.NumRows() == 0) return false;
++  KALDI_ASSERT(num_targets < 0 || targets.NumCols() == num_targets);
++
++  std::vector<ChunkTimeInfo> chunks;
++
++  utt_splitter->GetChunksForUtterance(num_input_frames, &chunks);
++
++  if (chunks.empty()) {
++    KALDI_WARN << "Not producing egs for utterance " << utt_id
++               << " because it is too short: " << num_input_frames
++               << " frames.";
++    return false;
++  }
++
++  // 'frame_subsampling_factor' is not used in any recipes at the time of
++  // writing, this is being supported to unify the code with the 'chain' recipes
++  // and in case we need it for some reason in future.
++  int32 frame_subsampling_factor =
++      utt_splitter->Config().frame_subsampling_factor;
++
++  for (size_t c = 0; c < chunks.size(); c++) {
++    const ChunkTimeInfo &chunk = chunks[c];
++
++    int32 tot_input_frames =
++        chunk.left_context + chunk.num_frames + chunk.right_context;
++
++    int32 start_frame = chunk.first_frame - chunk.left_context;
++
++    GeneralMatrix input_frames;
++    ExtractRowRangeWithPadding(feats, start_frame, tot_input_frames,
++                               &input_frames);
++
++    // 'input_frames' now stores the relevant rows (maybe with padding) from the
++    // original Matrix or (more likely) CompressedMatrix.  If a
++    // CompressedMatrix, it does this without un-compressing and re-compressing,
++    // so there is no loss of accuracy.
++
++    NnetExample eg;
++    // call the regular input "input".
++    eg.io.push_back(NnetIo("input", -chunk.left_context, input_frames));
++
++    if (ivector_feats != NULL) {
++      // if applicable, add the iVector feature.
++      // choose iVector from a random frame in the chunk
++      int32 ivector_frame =
++                RandInt(start_frame, start_frame + num_input_frames - 1),
++            ivector_frame_subsampled = ivector_frame / ivector_period;
++      if (ivector_frame_subsampled < 0) ivector_frame_subsampled = 0;
++      if (ivector_frame_subsampled >= ivector_feats->NumRows())
++        ivector_frame_subsampled = ivector_feats->NumRows() - 1;
++      Matrix<BaseFloat> ivector(1, ivector_feats->NumCols());
++      ivector.Row(0).CopyFromVec(ivector_feats->Row(ivector_frame_subsampled));
++      eg.io.push_back(NnetIo("ivector", 0, ivector));
++    }
++
++    // Note: chunk.first_frame and chunk.num_frames will both be
++    // multiples of frame_subsampling_factor.
++    int32 start_frame_subsampled = chunk.first_frame / frame_subsampling_factor,
++          num_frames_subsampled = chunk.num_frames / frame_subsampling_factor;
++
++    Posterior labels(num_frames_subsampled);
++
++    // TODO: it may be that using these weights is not actually helpful (with
++    // chain training, it was not), and that setting them all to 1 is better.
++    // We could add a boolean option to this program to control that; but I
++    // don't want to add such an option if experiments show that it is not
++    // helpful.
++    for (int32 i = 0; i < num_frames_subsampled; i++) {
++      int32 t = i + start_frame_subsampled;
++      if (t < pdf_post.size()) labels[i] = pdf_post[t];
++      for (std::vector<std::pair<int32, BaseFloat> >::iterator iter =
++               labels[i].begin();
++           iter != labels[i].end(); ++iter)
++        iter->second *= chunk.output_weights[i];
++    }
++
++    eg.io.push_back(
++        NnetIo("output", num_pdfs, 0, labels, frame_subsampling_factor));
++
++    // get-egs-dense-targets
++    KALDI_ASSERT(start_frame_subsampled + num_frames_subsampled - 1 <
++                 targets.NumRows());
++
++    // add the labels.
++    Matrix<BaseFloat> targets_part(num_frames_subsampled, targets.NumCols());
++    for (int32 i = 0; i < num_frames_subsampled; i++) {
++      // Copy the i^th row of the target matrix from the (t+i)^th row of the
++      // input targets matrix
++      int32 t = i + start_frame_subsampled;
++      if (t >= targets.NumRows()) t = targets.NumRows() - 1;
++      SubVector<BaseFloat> this_target_dest(targets_part, i);
++      SubVector<BaseFloat> this_target_src(targets, t);
++      this_target_dest.CopyFromVec(this_target_src);
++    }
++
++    // push this created targets matrix into the eg
++    eg.io.push_back(
++        NnetIo("output_ae", 0, targets_part, frame_subsampling_factor));
++
++    if (compress) eg.Compress();
++
++    std::ostringstream os;
++    os << utt_id << "-" << chunk.first_frame;
++
++    std::string key = os.str();  // key is <utt_id>-<frame_id>
++
++    example_writer->Write(key, eg);
++  }
++  return true;
++}
++
++}  // namespace nnet3
++}  // namespace kaldi
++
++int main(int argc, char *argv[]) {
++  try {
++    using namespace kaldi;
++    using namespace kaldi::nnet3;
++    typedef kaldi::int32 int32;
++    typedef kaldi::int64 int64;
++
++    const char *usage =
++        "Get frame-by-frame examples of data for nnet3 neural network "
++        "training.\n"
++        "Essentially this is a format change from features and posteriors\n"
++        "into a special frame-by-frame format.  This program handles the\n"
++        "common case where you have some input features, possibly some\n"
++        "iVectors, and one set of labels.  If people in future want to\n"
++        "do different things they may have to extend this program or create\n"
++        "different versions of it for different tasks (the egs format is "
++        "quite\n"
++        "general)\n"
++        "\n"
++        "Usage:  nnet3-get-egs-dcae [options] <features-rspecifier> "
++        "<pdf-post-rspecifier> <egs-out>\n"
++        "\n"
++        "An example [where $feats expands to the actual features]:\n"
++        "nnet3-get-egs-dcae --num-pdfs=2658 --num-targets=26 --left-context=12 "
++        "--right-context=9 "
++        "--num-frames=8 \"$feats\"\\\n"
++        "\"ark:gunzip -c exp/nnet/ali.1.gz | ali-to-pdf exp/nnet/1.nnet ark:- "
++        "ark:- | ali-to-post ark:- ark:- |\" \\\n"
++        "   ark:- \n"
++        "See also: nnet3-chain-get-egs, nnet3-get-egs-simple\n";
++
++    bool compress = true;
++    int32 num_pdfs = -1, num_targets = -1, length_tolerance = 100,
++          targets_length_tolerance = 2, online_ivector_period = 1;
++
++    ExampleGenerationConfig eg_config;  // controls num-frames,
++                                        // left/right-context, etc.
++
++    std::string online_ivector_rspecifier;
++
++    ParseOptions po(usage);
++
++    po.Register("compress", &compress,
++                "If true, write egs with input features "
++                "in compressed format (recommended).  This is "
++                "only relevant if the features being read are un-compressed; "
++                "if already compressed, we keep we same compressed format when "
++                "dumping egs.");
++    po.Register("num-pdfs", &num_pdfs,
++                "Number of pdfs in the acoustic "
++                "model");
++    po.Register("ivectors", &online_ivector_rspecifier,
++                "Alias for "
++                "--online-ivectors option, for back compatibility");
++    po.Register("online-ivectors", &online_ivector_rspecifier,
++                "Rspecifier of "
++                "ivector features, as a matrix.");
++    po.Register("online-ivector-period", &online_ivector_period,
++                "Number of "
++                "frames between iVectors in matrices supplied to the "
++                "--online-ivectors option");
++    po.Register("length-tolerance", &length_tolerance,
++                "Tolerance for "
++                "difference in num-frames between feat and ivector matrices");
++    po.Register("targets-length-tolerance", &targets_length_tolerance,
++                "Tolerance for "
++                "difference in num-frames (after subsampling) between "
++                "feature matrix and posterior and target matrices");
++    // get-egs-dense-targets
++    po.Register("num-targets", &num_targets,
++                "Output dimension in egs, "
++                "only used to check targets have correct dim if supplied.");
++    eg_config.Register(&po);
++
++    po.Read(argc, argv);
++
++    if (po.NumArgs() != 4) {
++      po.PrintUsage();
++      exit(1);
++    }
++
++    if (num_pdfs <= 0) KALDI_ERR << "--num-pdfs options is required.";
++
++    eg_config.ComputeDerived();
++    UtteranceSplitter utt_splitter(eg_config);
++
++    std::string feature_rspecifier = po.GetArg(1),
++                pdf_post_rspecifier = po.GetArg(2),
++                matrix_rspecifier = po.GetArg(3),  // get-egs-dense-targets
++        examples_wspecifier = po.GetArg(4);
++
++    // SequentialGeneralMatrixReader can read either a Matrix or
++    // CompressedMatrix (or SparseMatrix, but not as relevant here),
++    // and it retains the type.  This way, we can generate parts of
++    // the feature matrices without uncompressing and re-compressing.
++    SequentialGeneralMatrixReader feat_reader(feature_rspecifier);
++    RandomAccessPosteriorReader pdf_post_reader(pdf_post_rspecifier);
++    RandomAccessBaseFloatMatrixReader matrix_reader(
++        matrix_rspecifier);  // get-egs-dense-targets
++    NnetExampleWriter example_writer(examples_wspecifier);
++    RandomAccessBaseFloatMatrixReader online_ivector_reader(
++        online_ivector_rspecifier);
++
++    int32 num_err = 0;
++
++    for (; !feat_reader.Done(); feat_reader.Next()) {
++      std::string key = feat_reader.Key();
++      const GeneralMatrix &feats = feat_reader.Value();
++      if (!pdf_post_reader.HasKey(key)) {
++        KALDI_WARN << "No pdf-level posterior for key " << key;
++        num_err++;
++      } else if (!matrix_reader.HasKey(key)) {  // get-egs-dense-targets
++        KALDI_WARN << "No target matrix for key " << key;
++        num_err++;
++      } else {
++        const Posterior &pdf_post = pdf_post_reader.Value(key);
++        const Matrix<BaseFloat> &target_matrix =
++            matrix_reader.Value(key);  // get-egs-dense-targets
++        const Matrix<BaseFloat> *online_ivector_feats = NULL;
++        if (!online_ivector_rspecifier.empty()) {
++          if (!online_ivector_reader.HasKey(key)) {
++            KALDI_WARN << "No iVectors for utterance " << key;
++            num_err++;
++            continue;
++          } else {
++            // this address will be valid until we call HasKey() or Value()
++            // again.
++            online_ivector_feats = &(online_ivector_reader.Value(key));
++          }
++        }
++
++        if (online_ivector_feats != NULL &&
++            (abs(feats.NumRows() -
++                 (online_ivector_feats->NumRows() * online_ivector_period)) >
++                 length_tolerance ||
++             online_ivector_feats->NumRows() == 0)) {
++          KALDI_WARN << "Length difference between feats " << feats.NumRows()
++                     << " and iVectors " << online_ivector_feats->NumRows()
++                     << "exceeds tolerance " << length_tolerance;
++          num_err++;
++          continue;
++        }
++
++        if (!ProcessFile(feats, online_ivector_feats, online_ivector_period,
++                         pdf_post, key, compress, num_pdfs, target_matrix,
++                         num_targets, targets_length_tolerance, &utt_splitter,
++                         &example_writer))
++          num_err++;
++      }
++    }
++    if (num_err > 0)
++      KALDI_WARN << num_err
++                 << " utterances had errors and could "
++                    "not be processed.";
++    // utt_splitter prints stats in its destructor.
++    return utt_splitter.ExitStatus();
++  } catch (const std::exception &e) {
++    std::cerr << e.what() << '\n';
++    return -1;
++  }
++}
+-- 
+2.7.4
+
