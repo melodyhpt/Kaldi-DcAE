@@ -11,7 +11,7 @@ git clone https://github.com/kaldi-asr/kaldi.git kaldi --origin upstream
 ## Apply Patch
 At Kaldi's base directory
 ```
-git clone git@github.com:melodyhpt/Kaldi-DcAE.git
+git clone https://github.com/melodyhpt/Kaldi-DcAE.git
 ```
 
 Take a look at what changes are in the patch
